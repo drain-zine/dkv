@@ -1,0 +1,4 @@
+zig-out
+*.wal
+.zig-cache
+.DS_Store
