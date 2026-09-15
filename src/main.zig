@@ -13,8 +13,7 @@ pub fn main(init: std.process.Init) !void {
     var store = try Store.init(init.gpa, init.io, .{ .dir = Io.Dir.cwd(), .startup = .replay });
     defer store.deinit();
 
-    const address = try Io.net.IpAddress.parse(host, port);
-    var server = try Server.init(init.gpa, init.io, &store, .{ .address = address });
+    var server = try Server.init(init.gpa, init.io, &store, .{ .host = host, .port = port });
     defer server.deinit();
 
     log.info("replayed {d} keys, listening on {s}:{d}", .{ store.count(), host, port });

@@ -115,6 +115,7 @@ pub const Reply = union(enum) {
     error_request_too_large,
     error_arity: []const u8,
     error_unknown_command: []const u8,
+    error_max_clients,
 };
 
 pub fn encode(writer: *std.Io.Writer, reply: Reply) std.Io.Writer.Error!void {
@@ -134,6 +135,7 @@ pub fn encode(writer: *std.Io.Writer, reply: Reply) std.Io.Writer.Error!void {
         .error_unknown_command => |name| {
             try encodeErrorNamed(writer, "ERR unknown command '{s}'", name);
         },
+        .error_max_clients => try encodeError(writer, "ERR max number of clients reached"),
     }
 }
 

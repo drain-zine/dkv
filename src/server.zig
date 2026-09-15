@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const System = std.posix.system;
 
 const constants = @import("constants.zig");
+const resp = @import("resp.zig");
 const Session = @import("session.zig").Session;
 const Store = @import("store.zig").Store;
 
@@ -26,9 +27,7 @@ pub const Connection = struct {
     writable_registered: bool, // whether EVFILT.WRITE is currently enabled
 };
 
-pub const Options = struct {
-    address: Io.net.IpAddress,
-};
+pub const Options = struct { host: []const u8, port: u16 };
 
 pub const Server = struct {
     gpa: Allocator,
@@ -38,7 +37,8 @@ pub const Server = struct {
     connections: []Connection,
     request_memory: []u8,
     response_memory: []u8,
-    free_connection_index: u8 = 0,
+    free_connection_count: std.math.IntFittingRange(0, constants.connection_count_max) =
+        constants.connection_count_max,
     kqueue_fd: System.fd_t,
 
     pub fn init(gpa: Allocator, io: Io, store: *Store, options: Options) !Server {
@@ -58,15 +58,12 @@ pub const Server = struct {
         for (connections, 0..) |*connection, index| {
             const request_offset = index * request_buffer_size;
             const response_offset = index * response_buffer_size;
-            connection.* = .{
-                .session = .{},
-                .request_buffer = request_memory[request_offset..][0..request_buffer_size],
-                .response_buffer = response_memory[response_offset..][0..response_buffer_size],
-                .state = .free,
-            };
+            connection.* = .{ .session = .{}, .request_buffer = request_memory[request_offset..][0..request_buffer_size], .response_buffer = response_memory[response_offset..][0..response_buffer_size], .state = .free, .fd = -1, .request_size = 0, .response_size = 0, .response_size_sent = 0, .writable_registered = false };
         }
 
-        const listener = try options.address.listen(io, .{ .reuse_address = true });
+        const address = try Io.net.IpAddress.parse(options.host, options.port);
+        var listener = try address.listen(io, .{ .reuse_address = true });
+        errdefer listener.deinit(io);
 
         const kqueue_fd = System.kqueue();
         if (kqueue_fd < 0) return error.KqueueFailed;
@@ -74,17 +71,9 @@ pub const Server = struct {
 
         const listener_fd = listener.socket.handle;
         try setNonBlocking(listener_fd);
-        // try register(kqueue_fd, listener_fd, System.EVFILT.READ, System.EV.ADD, listener_udata);
+        try register(kqueue_fd, listener_fd, System.EVFILT.READ, System.EV.ADD, listener_udata);
 
-        return .{
-            .gpa = gpa,
-            .io = io,
-            .store = store,
-            .listener = listener,
-            .connections = connections,
-            .request_memory = request_memory,
-            .response_memory = response_memory,
-        };
+        return .{ .gpa = gpa, .io = io, .store = store, .listener = listener, .connections = connections, .request_memory = request_memory, .response_memory = response_memory, .kqueue_fd = kqueue_fd };
     }
 
     pub fn deinit(server: *Server) void {
@@ -92,48 +81,230 @@ pub const Server = struct {
         server.gpa.free(server.response_memory);
         server.gpa.free(server.request_memory);
         server.listener.deinit(server.io);
-        System.close(server.kqueue_fd);
+        _ = System.close(server.kqueue_fd);
         server.* = undefined;
     }
 
-    pub fn run(server: *Server) Io.net.Server.AcceptError!void {
+    pub fn run(server: *Server) !void {
+        var events: [constants.connection_count_max + 1]System.Kevent = undefined;
+
         while (true) {
-            const stream = server.listener.accept(server.io) catch |err| switch (err) {
-                error.ConnectionAborted => continue,
-                else => return err,
-            };
+            const event_count = try wait(server.kqueue_fd, &events);
 
-            defer stream.close(server.io);
+            for (events[0..event_count]) |event| {
+                if (event.udata == listener_udata) {
+                    server.acceptConnections();
+                    continue;
+                }
 
-            const connection = server.acquireConnection() orelse unreachable;
-            defer server.releaseConnection(connection);
+                assert(event.udata < constants.connection_count_max);
+                const connection = &server.connections[event.udata];
+                assert(connection.state != .free);
+                if (event.filter == System.EVFILT.READ) {
+                    server.readConnection(connection);
+                }
+            }
 
-            server.serve(connection, stream) catch |err| {
-                log.debug("connection closed: {s}", .{@errorName(err)});
-            };
+            for (server.connections) |*connection| {
+                if (connection.state == .free) continue;
+                if (connection.response_size_sent == connection.response_size) continue;
+                server.flushConnection(connection);
+            }
+
+            for (server.connections) |*connection| {
+                if (connection.state != .closing) continue;
+                if (connection.response_size_sent < connection.response_size) continue;
+                server.closeConnection(connection);
+            }
         }
     }
 
-    pub fn acquireConnection(server: *Server) ?*Connection {
-        assert(server.free_connection_index > -1);
-        assert(server.free_connection_index < constants.connection_count_max);
+    pub fn acquireConnection(server: *Server, fd: System.fd_t) ?*Connection {
+        assert(fd > -1);
+        assert(server.free_connection_count <= constants.connection_count_max);
 
-        var connection = &server.connections[server.free_connection_index];
-        assert(connection.state == .free);
-        connection.state = .open;
-        connection.session.closed = false;
-        server.free_connection_index += 1;
+        for (server.connections) |*connection| {
+            if (connection.state != .free) continue;
+            assert(server.free_connection_count > 0);
+            assert(connection.fd == -1);
 
-        return connection;
+            connection.state = .open;
+            connection.fd = fd;
+            connection.request_size = 0;
+            connection.response_size = 0;
+            connection.response_size_sent = 0;
+            connection.writable_registered = false;
+            connection.session.closed = false;
+            server.free_connection_count -= 1;
+            return connection;
+        }
+
+        assert(server.free_connection_count == 0);
+        return null;
     }
 
     pub fn releaseConnection(server: *Server, connection: *Connection) void {
-        assert(connection.state == .open);
-        connection.state = .free;
-        server.free_connection_index -= 1;
-        assert(server.free_connection_index > -1);
+        assert(connection.state == .closing);
+        assert(server.free_connection_count < constants.connection_count_max);
 
-        return;
+        connection.state = .free;
+        connection.fd = -1;
+        connection.request_size = 0;
+        connection.response_size = 0;
+        connection.response_size_sent = 0;
+        connection.writable_registered = false;
+        server.free_connection_count += 1;
+    }
+
+    fn acceptConnections(server: *Server) void {
+        const listener_fd = server.listener.socket.handle;
+
+        for (0..constants.connection_count_max) |_| {
+            const rc = System.accept(listener_fd, null, null);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => server.openConnection(rc),
+                .INTR, .CONNABORTED => continue,
+                .AGAIN => return,
+                else => |err| {
+                    log.warn("accept failed: errno {d}", .{@intFromEnum(err)});
+                    return;
+                },
+            }
+        }
+    }
+
+    fn openConnection(server: *Server, fd: System.fd_t) void {
+        assert(fd > -1);
+
+        const connection = server.acquireConnection(fd) orelse return rejectConnection(fd);
+        const index = server.connectionIndex(connection);
+
+        setNonBlocking(fd) catch |err| return server.abandonConnection(connection, err);
+        disableSigPipe(fd) catch |err| return server.abandonConnection(connection, err);
+        register(server.kqueue_fd, fd, System.EVFILT.READ, System.EV.ADD, index) catch |err| {
+            return server.abandonConnection(connection, err);
+        };
+    }
+
+    fn abandonConnection(server: *Server, connection: *Connection, err: anyerror) void {
+        _ = server;
+        assert(connection.state == .open);
+
+        log.debug("connection setup failed: {s}", .{@errorName(err)});
+        connection.state = .closing;
+    }
+
+    fn rejectConnection(fd: System.fd_t) void {
+        assert(fd > -1);
+
+        var reply_buffer: [64]u8 = undefined;
+        var writer: Io.Writer = .fixed(&reply_buffer);
+        resp.encode(&writer, .error_max_clients) catch unreachable;
+
+        const reply = writer.buffered();
+        _ = System.write(fd, reply.ptr, reply.len);
+        _ = System.close(fd);
+    }
+
+    fn readConnection(server: *Server, connection: *Connection) void {
+        if (connection.state != .open) return;
+        assert(connection.request_size < connection.request_buffer.len);
+
+        const unread = connection.request_buffer[connection.request_size..];
+        const rc = System.read(connection.fd, unread.ptr, unread.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => return,
+            else => {
+                connection.state = .closing;
+                return;
+            },
+        }
+        if (rc == 0) {
+            connection.state = .closing;
+            return;
+        }
+        connection.request_size += @intCast(rc);
+
+        const request = connection.request_buffer[0..connection.request_size];
+        var writer: Io.Writer = .fixed(connection.response_buffer[connection.response_size..]);
+        const outcome = connection.session.process(server.store, request, &writer) catch {
+            log.debug("response buffer full, closing connection", .{});
+            connection.state = .closing;
+            return;
+        };
+        connection.response_size += @intCast(writer.buffered().len);
+        assert(connection.response_size <= connection.response_buffer.len);
+
+        const consumed = outcome.input_size_consumed;
+        assert(consumed <= connection.request_size);
+        const remaining = connection.request_size - consumed;
+        std.mem.copyForwards(
+            u8,
+            connection.request_buffer[0..remaining],
+            connection.request_buffer[consumed..connection.request_size],
+        );
+        connection.request_size = @intCast(remaining);
+
+        if (outcome.close) connection.state = .closing;
+    }
+
+    fn flushConnection(server: *Server, connection: *Connection) void {
+        assert(connection.state != .free);
+        assert(connection.response_size_sent < connection.response_size);
+
+        const pending_start = connection.response_size_sent;
+        const pending = connection.response_buffer[pending_start..connection.response_size];
+        const rc = System.write(connection.fd, pending.ptr, pending.len);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => connection.response_size_sent += @intCast(rc),
+            .INTR, .AGAIN => {},
+            else => {
+                connection.response_size = 0;
+                connection.response_size_sent = 0;
+                connection.state = .closing;
+                return;
+            },
+        }
+        assert(connection.response_size_sent <= connection.response_size);
+
+        const index = server.connectionIndex(connection);
+        const kqueue_fd = server.kqueue_fd;
+        const write_filter = System.EVFILT.WRITE;
+        if (connection.response_size_sent == connection.response_size) {
+            connection.response_size = 0;
+            connection.response_size_sent = 0;
+            if (!connection.writable_registered) return;
+
+            connection.writable_registered = false;
+            register(kqueue_fd, connection.fd, write_filter, System.EV.DELETE, index) catch {
+                connection.state = .closing;
+            };
+        } else if (!connection.writable_registered) {
+            register(kqueue_fd, connection.fd, write_filter, System.EV.ADD, index) catch {
+                connection.state = .closing;
+                return;
+            };
+            connection.writable_registered = true;
+        }
+    }
+
+    fn closeConnection(server: *Server, connection: *Connection) void {
+        assert(connection.state == .closing);
+        assert(connection.response_size_sent == connection.response_size);
+        assert(connection.fd > -1);
+
+        _ = System.close(connection.fd);
+        server.releaseConnection(connection);
+    }
+
+    fn connectionIndex(server: *const Server, connection: *const Connection) usize {
+        const offset = @intFromPtr(connection) - @intFromPtr(server.connections.ptr);
+        assert(offset % @sizeOf(Connection) == 0);
+
+        const index = offset / @sizeOf(Connection);
+        assert(index < server.connections.len);
+        return index;
     }
 
     fn serve(
