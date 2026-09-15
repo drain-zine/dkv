@@ -69,6 +69,19 @@ comptime {
 }
 
 // ---------------------------------------------------------------------------
+// Event loop
+// ---------------------------------------------------------------------------
+
+/// Longest single wait for kqueue events. Bounds how long an idle loop sleeps,
+/// so periodic work such as group commit still runs without traffic.
+pub const event_loop_wait_timeout_ms = 1000;
+
+comptime {
+    // A zero timeout would turn the idle loop into a busy spin.
+    assert(event_loop_wait_timeout_ms > 0);
+}
+
+// ---------------------------------------------------------------------------
 // Write-ahead log
 // ---------------------------------------------------------------------------
 
