@@ -10,6 +10,8 @@ const Store = @import("store.zig").Store;
 
 const log = std.log.scoped(.server);
 
+const no_free_connections_sentinel = -1;
+
 pub const ConnectionState = enum(u8) { free, open, closing };
 
 pub const Connection = struct {
@@ -17,11 +19,11 @@ pub const Connection = struct {
     request_buffer: []u8,
     response_buffer: []u8,
     state: ConnectionState,
-    // fd: System.fd_t,
-    // request_size: u32, // bytes buffered in request_buffer
-    // response_size: u32, // bytes encoded into response_buffer
-    // response_size_sent: u32, // bytes of that already written
-    // writable_registered: bool, // whether EVFILT.WRITE is currently enabled
+    fd: System.fd_t,
+    request_size: u32, // bytes buffered in request_buffer
+    response_size: u32, // bytes encoded into response_buffer
+    response_size_sent: u32, // bytes of that already written
+    writable_registered: bool, // whether EVFILT.WRITE is currently enabled
 };
 
 pub const Options = struct {
@@ -37,7 +39,7 @@ pub const Server = struct {
     request_memory: []u8,
     response_memory: []u8,
     free_connection_index: u8 = 0,
-    //kqueue_fd: System.fd_t,
+    kqueue_fd: System.fd_t,
 
     pub fn init(gpa: Allocator, io: Io, store: *Store, options: Options) !Server {
         const connection_count = constants.connection_count_max;
@@ -104,7 +106,7 @@ pub const Server = struct {
     }
 
     pub fn acquireConnection(server: *Server) ?*Connection {
-        assert(server.free_connection_index > -1);
+        assert(server.free_connection_index > no_free_connections_sentinel);
         assert(server.free_connection_index < constants.connection_count_max);
 
         var connection = &server.connections[server.free_connection_index];
@@ -120,7 +122,7 @@ pub const Server = struct {
         assert(connection.state == .open);
         connection.state = .free;
         server.free_connection_index -= 1;
-        assert(server.free_connection_index >= 0);
+        assert(server.free_connection_index > no_free_connections_sentinel);
 
         return;
     }
