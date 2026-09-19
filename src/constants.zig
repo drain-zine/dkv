@@ -64,6 +64,10 @@ pub const connection_memory_max = 256 * 1024 * 1024;
 comptime {
     assert(connection_count_max <= 256);
 
+    // A reply is only ever encoded into an empty response buffer, so the
+    // largest one must fit or a connection could never make progress.
+    assert(resp_reply_size_max <= connection_response_buffer_size);
+
     const connection_size = connection_request_buffer_size + connection_response_buffer_size;
     assert(connection_count_max * connection_size <= connection_memory_max);
 }
@@ -76,9 +80,29 @@ comptime {
 /// so periodic work such as group commit still runs without traffic.
 pub const event_loop_wait_timeout_ms = 1000;
 
+/// One receive and one send per connection, plus the accept.
+pub const io_in_flight_max = connection_count_max * 2 + 1;
+
+/// Registrations submitted in one `kevent` call: at most one per operation
+/// waiting on readiness.
+pub const io_change_count_max = io_in_flight_max;
+
+/// Events collected from one `kevent` call.
+pub const io_event_count_max = io_in_flight_max;
+
+/// A syscall interrupted by a signal is retried this many times before it is
+/// reported as a failure. Bounds every retry loop in the IO backends.
+pub const io_syscall_retry_max = 8;
+
+/// Ring capacity, a power of two so wrapping is a mask rather than a division.
+pub const io_ring_capacity = 256;
+
 comptime {
     // A zero timeout would turn the idle loop into a busy spin.
     assert(event_loop_wait_timeout_ms > 0);
+
+    assert(io_ring_capacity >= io_in_flight_max);
+    assert(io_ring_capacity & (io_ring_capacity - 1) == 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -61,7 +61,7 @@ pub const Store = struct {
     /// Logs first, then applies. Panics if either step fails, because the log
     /// and memory would no longer agree.
     pub fn put(self: *Store, key: []const u8, value: []const u8) void {
-        _ = self.wal.append(.PUT, key, value) catch |err| fatal("put: log append", err);
+        _ = self.wal.append(.put, key, value) catch |err| fatal("put: log append", err);
         applyPut(self.gpa, &self.map, key, value) catch |err| fatal("put: apply", err);
     }
 
@@ -69,7 +69,7 @@ pub const Store = struct {
     /// stays a faithful history rather than depending on state at the time.
     /// Panics if logging fails.
     pub fn remove(self: *Store, key: []const u8) bool {
-        _ = self.wal.append(.REMOVE, key, "") catch |err| fatal("remove: log append", err);
+        _ = self.wal.append(.remove, key, "") catch |err| fatal("remove: log append", err);
         return applyRemove(self.gpa, &self.map, key);
     }
 
@@ -84,8 +84,8 @@ pub const Store = struct {
 
         pub fn apply(self: *Replayer, body: wal.Body) wal.Sink.Error!void {
             switch (body.op) {
-                .PUT => try applyPut(self.gpa, self.map, body.key, body.value),
-                .REMOVE => _ = applyRemove(self.gpa, self.map, body.key),
+                .put => try applyPut(self.gpa, self.map, body.key, body.value),
+                .remove => _ = applyRemove(self.gpa, self.map, body.key),
             }
         }
     };

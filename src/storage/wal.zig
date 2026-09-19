@@ -6,13 +6,15 @@
 //! short, has impossible lengths, or fails its CRC; that point is the torn
 //! tail from a crash and gets truncated on the next `open`.
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Crc32c = std.hash.crc.Crc32Iscsi;
 
-const constants = @import("constants.zig");
+const constants = @import("../constants.zig");
 
-pub const Operation = enum(u8) { PUT = 1, REMOVE = 2 };
+pub const Operation = enum(u8) { put = 1, remove = 2 };
+
 pub const Durability = enum {
     /// Every append is flushed and synced before it returns.
     always,
@@ -23,6 +25,7 @@ pub const Durability = enum {
     /// Never synced explicitly. Flushed only when the buffer fills or on close.
     never,
 };
+
 pub const Header = extern struct {
     crc32c: u32,
     /// Number of bytes after this field: the rest of the header plus the body.
@@ -38,7 +41,7 @@ pub const Header = extern struct {
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Header) == 24);
+    assert(@sizeOf(Header) == 24);
 }
 
 /// A decoded record. Slices point into a buffer owned by the `Reader` and are
@@ -77,8 +80,8 @@ pub const Sink = struct {
 
     /// Hands one record to the wrapped value. The `Body` slices are only
     /// valid for the duration of this call.
-    pub fn apply(sink: Sink, body: Body) Error!void {
-        return sink.apply_fn(sink.context, body);
+    pub fn apply(self: Sink, body: Body) Error!void {
+        return self.apply_fn(self.context, body);
     }
 
     fn check(comptime T: type) void {
@@ -133,28 +136,19 @@ pub const Reader = struct {
 
     /// Returns null at the end of valid data. Real IO failures are errors.
     pub fn next(self: *Reader) !?Body {
-        const r = &self.file_reader.interface;
+        const stream = &self.file_reader.interface;
 
-        const header: Header = (r.takeStructPointer(Header) catch |err| switch (err) {
+        const header: Header = (stream.takeStructPointer(Header) catch |err| switch (err) {
             error.EndOfStream => return null, // short header: torn tail
             else => return err,
         }).*;
 
         if (header.len < Header.covered) return null;
         const body_len = header.len - Header.covered;
-        if (body_len > constants.wal_record_size_max or header.key_len > body_len) return null;
+        if (body_len > constants.wal_record_size_max) return null;
+        if (header.key_len > body_len) return null;
 
-        const body: []const u8 = if (body_len <= r.buffer.len) r.take(body_len) catch |err| switch (err) {
-            error.EndOfStream => return null,
-            else => return err,
-        } else blk: {
-            try self.body.resize(self.gpa, body_len);
-            r.readSliceAll(self.body.items) catch |err| switch (err) {
-                error.EndOfStream => return null,
-                else => return err,
-            };
-            break :blk self.body.items;
-        };
+        const body = (try self.readBody(body_len)) orelse return null;
 
         var hash = Crc32c.init();
         hash.update(std.mem.asBytes(&header)[8..]);
@@ -171,6 +165,27 @@ pub const Reader = struct {
             .key = body[0..header.key_len],
             .value = body[header.key_len..],
         };
+    }
+
+    /// Null when the body is short, which is a torn tail rather than a failure.
+    /// A body that fits the read buffer is borrowed from it; a larger one is
+    /// staged in `body`, which grows to the largest record seen.
+    fn readBody(self: *Reader, body_len: u32) !?[]const u8 {
+        const stream = &self.file_reader.interface;
+
+        if (body_len <= stream.buffer.len) {
+            return stream.take(body_len) catch |err| switch (err) {
+                error.EndOfStream => return null,
+                else => return err,
+            };
+        }
+
+        try self.body.resize(self.gpa, body_len);
+        stream.readSliceAll(self.body.items) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return err,
+        };
+        return self.body.items;
     }
 };
 
@@ -221,7 +236,7 @@ pub const Wal = struct {
         const size = (try file.stat(io)).size;
         if (size != reader.valid_end) try file.setLength(io, reader.valid_end);
 
-        var self: Wal = .{
+        var wal: Wal = .{
             .file = file,
             .io = io,
             .gpa = gpa,
@@ -231,8 +246,8 @@ pub const Wal = struct {
             .durability = options.durability,
             .last_sync = Io.Timestamp.now(io, .awake),
         };
-        try self.writer.seekTo(reader.valid_end);
-        return self;
+        try wal.writer.seekTo(reader.valid_end);
+        return wal;
     }
 
     pub fn close(self: *Wal) void {
@@ -246,6 +261,10 @@ pub const Wal = struct {
     /// durability the record is on disk when this returns. On error nothing
     /// should be applied to the in-memory state.
     pub fn append(self: *Wal, op: Operation, key: []const u8, value: []const u8) !u64 {
+        // A record larger than this replays as a torn tail, so it would be
+        // written now and silently lost on the next open.
+        assert(Header.covered + key.len + value.len <= constants.wal_record_size_max);
+
         const seq = self.next_seq;
 
         var header: Header = .{
@@ -262,16 +281,17 @@ pub const Wal = struct {
         hash.update(value);
         header.crc32c = hash.final();
 
-        const w = &self.writer.interface;
-        try w.writeAll(std.mem.asBytes(&header));
-        try w.writeAll(key);
-        try w.writeAll(value);
+        const stream = &self.writer.interface;
+        try stream.writeAll(std.mem.asBytes(&header));
+        try stream.writeAll(key);
+        try stream.writeAll(value);
 
         switch (self.durability) {
             .always => try self.sync(),
             .everysec => {
                 const now = Io.Timestamp.now(self.io, .awake);
-                if (self.last_sync.durationTo(now).nanoseconds >= std.time.ns_per_s) try self.sync();
+                const since_sync = self.last_sync.durationTo(now).nanoseconds;
+                if (since_sync >= std.time.ns_per_s) try self.sync();
             },
             .never => {},
         }
@@ -307,12 +327,12 @@ const Collector = struct {
     }
 
     pub fn apply(self: *Collector, body: Body) Sink.Error!void {
-        const a = self.arena.allocator();
-        try self.entries.append(a, .{
+        const arena = self.arena.allocator();
+        try self.entries.append(arena, .{
             .seq = body.seq,
             .op = body.op,
-            .key = try a.dupe(u8, body.key),
-            .value = try a.dupe(u8, body.value),
+            .key = try arena.dupe(u8, body.key),
+            .value = try arena.dupe(u8, body.value),
         });
     }
 };
@@ -325,9 +345,9 @@ test "append then replay" {
     {
         var wal = try Wal.open(testing.allocator, io, tmp.dir, "test.wal", .{}, null);
         defer wal.close();
-        try testing.expectEqual(1, try wal.append(.PUT, "a", "1"));
-        try testing.expectEqual(2, try wal.append(.PUT, "bb", "two words"));
-        try testing.expectEqual(3, try wal.append(.REMOVE, "a", ""));
+        try testing.expectEqual(1, try wal.append(.put, "a", "1"));
+        try testing.expectEqual(2, try wal.append(.put, "bb", "two words"));
+        try testing.expectEqual(3, try wal.append(.remove, "a", ""));
     }
 
     var collector = Collector.init(testing.allocator);
@@ -343,14 +363,14 @@ test "append then replay" {
     defer wal.close();
 
     try testing.expectEqual(4, wal.next_seq);
-    const e = collector.entries.items;
-    try testing.expectEqual(3, e.len);
-    try testing.expectEqual(.PUT, e[0].op);
-    try testing.expectEqualStrings("a", e[0].key);
-    try testing.expectEqualStrings("1", e[0].value);
-    try testing.expectEqualStrings("two words", e[1].value);
-    try testing.expectEqual(.REMOVE, e[2].op);
-    try testing.expectEqual(3, e[2].seq);
+    const entries = collector.entries.items;
+    try testing.expectEqual(3, entries.len);
+    try testing.expectEqual(.put, entries[0].op);
+    try testing.expectEqualStrings("a", entries[0].key);
+    try testing.expectEqualStrings("1", entries[0].value);
+    try testing.expectEqualStrings("two words", entries[1].value);
+    try testing.expectEqual(.remove, entries[2].op);
+    try testing.expectEqual(3, entries[2].seq);
 }
 
 test "torn tail is dropped and truncated" {
@@ -362,17 +382,23 @@ test "torn tail is dropped and truncated" {
     {
         var wal = try Wal.open(testing.allocator, io, tmp.dir, "test.wal", .{}, null);
         defer wal.close();
-        _ = try wal.append(.PUT, "a", "1");
-        _ = try wal.append(.PUT, "b", "2");
+        _ = try wal.append(.put, "a", "1");
+        _ = try wal.append(.put, "b", "2");
         try wal.sync();
         good_size = (try wal.file.stat(io)).size;
 
         // Simulate a crash mid-write: a header with a plausible length but
         // no body behind it, then some garbage.
-        const w = &wal.writer.interface;
-        const half: Header = .{ .crc32c = 0, .len = Header.covered + 100, .seq = 3, .op = 1, .key_len = 1 };
-        try w.writeAll(std.mem.asBytes(&half));
-        try w.writeAll("garbage");
+        const stream = &wal.writer.interface;
+        const header_torn: Header = .{
+            .crc32c = 0,
+            .len = Header.covered + 100,
+            .seq = 3,
+            .op = 1,
+            .key_len = 1,
+        };
+        try stream.writeAll(std.mem.asBytes(&header_torn));
+        try stream.writeAll("garbage");
     }
 
     var collector = Collector.init(testing.allocator);
@@ -392,7 +418,7 @@ test "torn tail is dropped and truncated" {
     try testing.expectEqual(good_size, (try wal.file.stat(io)).size);
 
     // Appending after recovery lands right after the last good record.
-    try testing.expectEqual(3, try wal.append(.PUT, "c", "3"));
+    try testing.expectEqual(3, try wal.append(.put, "c", "3"));
 }
 
 test "corrupted byte in the middle stops replay there" {
@@ -403,9 +429,9 @@ test "corrupted byte in the middle stops replay there" {
     {
         var wal = try Wal.open(testing.allocator, io, tmp.dir, "test.wal", .{}, null);
         defer wal.close();
-        _ = try wal.append(.PUT, "a", "1");
-        _ = try wal.append(.PUT, "b", "2");
-        _ = try wal.append(.PUT, "c", "3");
+        _ = try wal.append(.put, "a", "1");
+        _ = try wal.append(.put, "b", "2");
+        _ = try wal.append(.put, "c", "3");
     }
 
     // Flip a byte inside the second record's value.
