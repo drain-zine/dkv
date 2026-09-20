@@ -21,6 +21,7 @@ pub const Io = switch (builtin.os.tag) {
     .openbsd,
     .dragonfly,
     => @import("kqueue.zig").Kqueue,
+    .linux => @import("epoll.zig").Epoll,
     else => @compileError("dkv has no IO backend for " ++ @tagName(builtin.os.tag)),
 };
 

@@ -1,312 +1,152 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for the dkv server.
+"""Binary-level checks for dkv.
 
-Starts the built binary in a temporary directory (so its WAL never lands in the
-repo), talks to it over TCP and with redis-cli, then stops it.
+`zig build test` covers the protocol, framing, backpressure, connection limits
+and restart-by-reopen in process. This script covers only what those cannot
+reach: the shipped binary, its command line, a real client, and whether an
+acknowledged write survives the process being killed outright.
 
 Usage:
     zig build && python3 scripts/smoke.py [path/to/dkv]
-
-Exit code is 0 when every check passes. Known limits are reported separately
-and do not affect the exit code.
 """
 
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 HOST = "127.0.0.1"
-PORT = 6379
+PORT = 6399
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_BINARY = os.path.join(REPO_ROOT, "zig-out", "bin", "dkv")
 
 results = []
-known_limits = []
-
-
-def shown(value):
-    if isinstance(value, bytes) and len(value) > 200:
-        return value[:60] + b"...(" + str(len(value)).encode() + b" bytes)"
-    return value
 
 
 def check(label, actual, expected):
     ok = actual == expected
-    results.append((label, ok))
+    results.append(ok)
     line = ("PASS " if ok else "FAIL ") + label
     if not ok:
-        line += f"\n     expected {shown(expected)!r}\n     actual   {shown(actual)!r}"
+        line += f"\n     expected {expected!r}\n     actual   {actual!r}"
     print(line, flush=True)
 
 
-def known_limit(label, ok, detail):
-    known_limits.append((label, ok, detail))
+def listening(port, process=None, timeout=10.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
+        try:
+            socket.create_connection((HOST, port), 0.1).close()
+            return True
+        except OSError:
+            time.sleep(0.02)
+    return False
 
 
-def port_in_use():
-    try:
-        socket.create_connection((HOST, PORT), timeout=0.2).close()
-        return True
-    except OSError:
-        return False
-
-
-class Server:
-    def __init__(self, binary, workdir):
-        self.binary = binary
-        self.workdir = workdir
-        self.log_path = os.path.join(workdir, "server.log")
-        self.process = None
-
-    def start(self):
-        log = open(self.log_path, "ab")
-        self.process = subprocess.Popen([self.binary], cwd=self.workdir, stdout=log, stderr=log)
-        for _ in range(100):
-            if self.process.poll() is not None:
-                raise SystemExit(f"server exited early with code {self.process.returncode}")
-            try:
-                socket.create_connection((HOST, PORT), timeout=0.1).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        raise SystemExit("server did not start listening")
-
-    def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-
-
-def cli(*arguments):
-    completed = subprocess.run(
-        ["redis-cli", "-h", HOST, "-p", str(PORT), *arguments],
-        capture_output=True,
-        text=True,
-        timeout=5,
+def start(binary, workdir, *flags):
+    log = open(os.path.join(workdir, "server.log"), "ab")
+    process = subprocess.Popen(
+        [binary, f"--port={PORT}", f"--dir={workdir}", *flags],
+        cwd=workdir, stdout=log, stderr=log,
     )
-    return completed.stdout.strip()
+    if not listening(PORT, process):
+        raise SystemExit(f"server did not start: see {workdir}/server.log")
+    return process
 
 
-def bulk(*arguments):
+def stop(process, kill=False):
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGKILL if kill else signal.SIGTERM)
+    process.wait(timeout=5)
+    # The port is only free once the kernel has reaped the listener.
+    deadline = time.time() + 5
+    while time.time() < deadline and listening(PORT, timeout=0.05):
+        time.sleep(0.02)
+
+
+def talk(*arguments):
+    """One command on a fresh connection. Returns the raw reply."""
     out = b"*" + str(len(arguments)).encode() + b"\r\n"
     for argument in arguments:
         out += b"$" + str(len(argument)).encode() + b"\r\n" + argument + b"\r\n"
-    return out
 
-
-def recv_exact(connection, size):
-    received = b""
-    while len(received) < size:
-        data = connection.recv(65536)
-        if not data:
-            break
-        received += data
-    return received
-
-
-def exchange(chunks, expected_size, pause=0.0):
-    connection = socket.create_connection((HOST, PORT), timeout=5)
-    for chunk in chunks:
-        connection.sendall(chunk)
-        if pause:
-            time.sleep(pause)
-    received = recv_exact(connection, expected_size)
-    connection.close()
-    return received
-
-
-def read_until_closed(payload):
     connection = socket.create_connection((HOST, PORT), timeout=5)
     try:
-        if payload:
-            connection.sendall(payload)
-    except (BrokenPipeError, ConnectionResetError):
-        pass
-    received = b""
-    while True:
-        try:
-            data = connection.recv(65536)
-        except (ConnectionResetError, socket.timeout):
-            break
-        if not data:
-            break
-        received += data
-    connection.close()
-    return received
-
-
-def check_commands():
-    check("redis-cli PING", cli("PING"), "PONG")
-    check("redis-cli SET", cli("SET", "name", "tom"), "OK")
-    check("redis-cli GET", cli("GET", "name"), "tom")
-    check("redis-cli GET missing", cli("GET", "missing"), "")
-    check("redis-cli DEL counts removed keys", cli("DEL", "name", "missing"), "1")
-    check("redis-cli SET again", cli("SET", "name", "tom"), "OK")
-    check("redis-cli unknown command", cli("NOPE", "x"), "ERR unknown command 'NOPE'")
-    check("redis-cli arity error", cli("GET"), "ERR wrong number of arguments for 'get' command")
-
-
-def check_framing():
-    pipelined = bulk(b"PING") + bulk(b"SET", b"a", b"1") + bulk(b"GET", b"a")
-    expected = b"+PONG\r\n+OK\r\n$1\r\n1\r\n"
-    check("pipelined batch in one write", exchange([pipelined], len(expected)), expected)
-
-    request = bulk(b"GET", b"a")
-    expected = b"$1\r\n1\r\n"
-    chunks = [request[i:i + 1] for i in range(len(request))]
-    check("command split byte by byte", exchange(chunks, len(expected), pause=0.003), expected)
-
-    expected = b"+PONG\r\n+OK\r\n$5\r\nworld\r\n"
-    inline = b"PING\r\n\r\nSET hello world\r\nGET hello\r\n"
-    check("inline commands with empty line", exchange([inline], len(expected)), expected)
-
-    expected = b"+OK\r\n$4\r\na\r\nb\r\n"
-    binary = bulk(b"SET", b"bin", b"a\r\nb") + bulk(b"GET", b"bin")
-    check("binary safe value", exchange([binary], len(expected)), expected)
-
-
-def check_large_values():
-    value = b"v" * (1024 * 1024)
-    connection = socket.create_connection((HOST, PORT), timeout=10)
-    connection.sendall(bulk(b"SET", b"big", value))
-    check("SET 1 MiB value", recv_exact(connection, 5), b"+OK\r\n")
-
-    expected = b"$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
-    for round_number in range(3):
-        connection.sendall(bulk(b"GET", b"big"))
-        time.sleep(0.05)
-        received = recv_exact(connection, len(expected))
-        check(f"GET 1 MiB with slow reader, round {round_number + 1}", received, expected)
-
-    connection.sendall(b"PING\r\n")
-    check("small reply after large partial writes", recv_exact(connection, 7), b"+PONG\r\n")
-    connection.close()
-
-    connection = socket.create_connection((HOST, PORT), timeout=5)
-    expected = b"+OK\r\n$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
-    connection.sendall(bulk(b"SET", b"big2", value) + bulk(b"GET", b"big2"))
-    received = recv_exact(connection, len(expected))
-    connection.close()
-    check("SET + GET of 1 MiB pipelined in one write", received, expected)
-
-
-def check_broken_clients():
-    payload = b"*1\r\n+OK\r\n" + bulk(b"PING")
-    check("protocol error replies then closes", read_until_closed(payload), b"-ERR Protocol error\r\n")
-    check("slot reused after a protocol-error close", cli("PING"), "PONG")
-
-    abrupt = socket.create_connection((HOST, PORT), timeout=2)
-    abrupt.sendall(b"*2\r\n$3\r\nGET\r\n$5\r\nhal")
-    abrupt.close()
-    time.sleep(0.1)
-    check("client disconnecting mid-command does not disturb the server", cli("PING"), "PONG")
-
-
-def check_concurrency():
-    holder = socket.create_connection((HOST, PORT), timeout=2)
-    holder.sendall(b"PING\r\n")
-    recv_exact(holder, 7)
-    other = socket.create_connection((HOST, PORT), timeout=2)
-    other.sendall(b"PING\r\n")
-    try:
-        immediate = recv_exact(other, 7)
-    except socket.timeout:
-        immediate = b"(timed out)"
-    check("second client served while first stays connected", immediate, b"+PONG\r\n")
-    other.close()
-    holder.close()
-
-    failures = []
-
-    def client_worker(worker):
-        try:
-            connection = socket.create_connection((HOST, PORT), timeout=10)
-            batch, want = b"", b""
-            for i in range(50):
-                key = f"w{worker}k{i}".encode()
-                value = f"value-{worker}-{i}".encode()
-                batch += bulk(b"SET", key, value) + bulk(b"GET", key)
-                want += b"+OK\r\n$" + str(len(value)).encode() + b"\r\n" + value + b"\r\n"
-            connection.sendall(batch)
-            if recv_exact(connection, len(want)) != want:
-                failures.append(worker)
-            connection.close()
-        except Exception as error:
-            failures.append((worker, repr(error)))
-
-    threads = [threading.Thread(target=client_worker, args=(worker,)) for worker in range(20)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    check("20 concurrent clients pipelining 100 commands each", failures, [])
-
-
-def check_connection_limit():
-    holders = []
-    for _ in range(64):
-        connection = socket.create_connection((HOST, PORT), timeout=5)
-        connection.sendall(b"PING\r\n")
-        holders.append((connection, recv_exact(connection, 7)))
-    all_accepted = all(reply == b"+PONG\r\n" for _, reply in holders)
-    check("64 simultaneous connections all accepted", all_accepted, True)
-
-    rejected = read_until_closed(b"")
-    check("65th connection rejected with max clients error", rejected, b"-ERR max number of clients reached\r\n")
-
-    order = [5, 60, 0, 33, 12, 63] + [i for i in range(64) if i not in (5, 60, 0, 33, 12, 63)]
-    for index in order:
-        holders[index][0].close()
-    time.sleep(0.2)
-    check("slots freed after 64 clients disconnect in mixed order", cli("PING"), "PONG")
-
-
-def check_restart(server):
-    server.stop()
-    server.start()
-    check("SET survives restart via WAL replay", cli("GET", "name"), "tom")
-    check("DEL survives restart via WAL replay", cli("GET", "missing"), "")
+        connection.sendall(out)
+        return connection.recv(65536)
+    finally:
+        connection.close()
 
 
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BINARY
     if not os.path.isfile(binary):
         raise SystemExit(f"binary not found: {binary} (run `zig build` first)")
-    if shutil.which("redis-cli") is None:
-        raise SystemExit("redis-cli not found on PATH")
-    if port_in_use():
+    if listening(PORT, timeout=0.2):
         raise SystemExit(f"something is already listening on {HOST}:{PORT}")
 
-    workdir = tempfile.mkdtemp(prefix="dkv-smoke-")
-    server = Server(binary, workdir)
+    durable = tempfile.mkdtemp(prefix="dkv-smoke-durable-")
+    buffered = tempfile.mkdtemp(prefix="dkv-smoke-buffered-")
+
+    # The shipped binary, its flags, and a real client.
+    server = start(binary, durable, "--durability=always")
     try:
-        server.start()
-        check_commands()
-        check_framing()
-        check_large_values()
-        check_broken_clients()
-        check_concurrency()
-        check_connection_limit()
-        check_restart(server)
+        check("binary serves on the port it was given", talk(b"PING"), b"+PONG\r\n")
+        check("--dir holds the log", os.path.isfile(os.path.join(durable, "dkv.wal")), True)
+
+        talk(b"SET", b"survives", b"yes")
+        check("write is acknowledged", talk(b"GET", b"survives"), b"$3\r\nyes\r\n")
+
+        if shutil.which("redis-cli"):
+            reply = subprocess.run(
+                ["redis-cli", "-h", HOST, "-p", str(PORT), "GET", "survives"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            check("redis-cli reads it back", reply, "yes")
+        else:
+            print("SKIP redis-cli not on PATH", flush=True)
     finally:
-        server.stop()
+        stop(server, kill=True)
 
-    passed = sum(1 for _, ok in results if ok)
+    # An acknowledged write is durable, so SIGKILL cannot take it back.
+    server = start(binary, durable, "--durability=always")
+    try:
+        check("acknowledged write survives SIGKILL",
+              talk(b"GET", b"survives"), b"$3\r\nyes\r\n")
+    finally:
+        stop(server)
+
+    # The same write under --durability=never is still only in the log's
+    # buffer, so killing the process does take it back. Proves the flag bites.
+    server = start(binary, buffered, "--durability=never")
+    try:
+        talk(b"SET", b"transient", b"yes")
+        check("write is acknowledged without a barrier",
+              talk(b"GET", b"transient"), b"$3\r\nyes\r\n")
+    finally:
+        stop(server, kill=True)
+
+    server = start(binary, buffered, "--durability=never")
+    try:
+        check("--durability=never loses it on SIGKILL",
+              talk(b"GET", b"transient"), b"$-1\r\n")
+    finally:
+        stop(server)
+
+    # A bad command line must fail before anything is served.
+    refused = subprocess.run([binary, "--nope=1"], capture_output=True, text=True, timeout=5)
+    check("an unknown flag refuses to start", refused.returncode != 0, True)
+
+    passed = sum(1 for ok in results if ok)
     print(f"\n{passed}/{len(results)} passed")
-    for label, ok, detail in known_limits:
-        status = "now passes" if ok else "still fails"
-        print(f"KNOWN LIMIT {status}: {label} ({detail})")
-    print(f"server log: {server.log_path}")
-
+    print(f"logs: {durable}  {buffered}")
     sys.exit(0 if passed == len(results) else 1)
 
 

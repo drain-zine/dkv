@@ -14,6 +14,8 @@ const darwin = switch (builtin.os.tag) {
     else => false,
 };
 
+const linux = builtin.os.tag == .linux;
+
 pub fn syncBarrier(fd: Handle) Error!void {
     assert(fd > -1);
 
@@ -31,9 +33,14 @@ pub fn syncBarrier(fd: Handle) Error!void {
     return sync(fd);
 }
 
+/// Linux needs no `F_FULLFSYNC`: its `fsync` already flushes the device. What
+/// it offers instead is a cheaper call — `fdatasync` skips rewriting inode
+/// timestamps while still persisting the metadata needed to read the data
+/// back, which for an append-only log is the file size. Postgres defaults to
+/// the same choice.
 fn sync(fd: Handle) Error!void {
     for (0..constants.io_syscall_retry_max) |_| {
-        const rc = System.fsync(fd);
+        const rc = if (linux) System.fdatasync(fd) else System.fsync(fd);
         switch (std.posix.errno(rc)) {
             .SUCCESS => return,
             .INTR => continue,

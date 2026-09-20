@@ -52,6 +52,14 @@ comptime {
 }
 
 // ---------------------------------------------------------------------------
+// Cluster
+// ---------------------------------------------------------------------------
+
+/// Replicas in one cluster. A quorum needs an odd count, and the addresses are
+/// held in a fixed array, so this bounds `--addresses`.
+pub const cluster_replica_count_max = 7;
+
+// ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
 
@@ -65,11 +73,29 @@ pub const io_syscall_retry_max = 8;
 
 pub const io_ring_capacity = 256;
 
+/// Descriptors held besides the connections: the standard streams, the
+/// listener, the event queue, and the write-ahead log.
+pub const io_descriptor_reserved_count = 8;
+
+/// Descriptor numbers are assigned lowest-unused, so the process never sees a
+/// number at or above its own high-water mark of open descriptors.
+pub const io_descriptor_count_max = connection_count_max + io_descriptor_reserved_count;
+
+/// epoll registers one entry per descriptor rather than one per operation, so
+/// that backend keeps a table indexed by descriptor number.
+pub const io_registration_count_max = 256;
+
 comptime {
     assert(event_loop_wait_timeout_ms > 0);
 
     assert(io_ring_capacity >= io_in_flight_max);
     assert(io_ring_capacity & (io_ring_capacity - 1) == 0);
+
+    assert(io_registration_count_max >= io_descriptor_count_max);
+
+    // kqueue queues one change per pending operation, epoll one per descriptor.
+    assert(io_change_count_max >= io_in_flight_max);
+    assert(io_change_count_max >= io_descriptor_count_max);
 }
 
 // ---------------------------------------------------------------------------
