@@ -1,7 +1,3 @@
-//! The vocabulary shared by every IO backend: what can be asked for, and what
-//! comes back. Imports nothing from the backends or the facade, so the IO
-//! files form a stack rather than a cycle.
-
 const std = @import("std");
 const System = std.posix.system;
 

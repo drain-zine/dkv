@@ -37,7 +37,6 @@ pub const Kqueue = struct {
         Unexpected,
     };
 
-    /// What an operation waits on: its descriptor, and which readiness it needs.
     const Arming = struct { fd: System.fd_t, filter: i16 };
     const Progress = enum { completed, io_pending };
 
@@ -82,8 +81,6 @@ pub const Kqueue = struct {
     // Operations
     // -----------------------------------------------------------------------
 
-    /// Accepts one connection. The result is a descriptor that is already
-    /// non-blocking with SIGPIPE disabled.
     pub fn accept(
         self: *Kqueue,
         comptime Context: type,
@@ -109,7 +106,6 @@ pub const Kqueue = struct {
         );
     }
 
-    /// Reads into `buffer`. A result of 0 means the peer closed its side.
     pub fn recv(
         self: *Kqueue,
         comptime Context: type,
@@ -137,8 +133,6 @@ pub const Kqueue = struct {
         );
     }
 
-    /// Writes `bytes`. The result may be fewer than `bytes.len`; the caller
-    /// resubmits the remainder.
     pub fn send(
         self: *Kqueue,
         comptime Context: type,
@@ -166,8 +160,6 @@ pub const Kqueue = struct {
         );
     }
 
-    /// Closes `fd`. Never blocks, so it completes in the pass it is submitted.
-    /// Close failures are ignored deliberately: there is nothing to retry.
     pub fn close(
         self: *Kqueue,
         comptime Context: type,
@@ -201,7 +193,6 @@ pub const Kqueue = struct {
             self.change_count == 0;
         if (nothing_can_wake_us) return;
 
-        // Completions already waiting are collected without sleeping.
         const collect_only = self.completed.count > 0;
         const timeout = timespecForNs(if (collect_only) 0 else nanoseconds);
 
@@ -210,9 +201,6 @@ pub const Kqueue = struct {
         assert(self.change_count == 0);
     }
 
-    /// Submits the queued registrations and collects whatever is ready. Woken
-    /// completions are retried before returning, so an operation that blocked
-    /// earlier in this pass can still finish in it.
     fn waitForEvents(self: *Kqueue, timeout: System.timespec) op.RunError!void {
         const event_count = try self.kevent(timeout);
         assert(self.change_count == 0);
@@ -230,7 +218,6 @@ pub const Kqueue = struct {
         if (event_count > 0) self.flushSubmitted();
     }
 
-    /// One `kevent` call: the queued changes go out, ready events come back.
     fn kevent(self: *Kqueue, timeout: System.timespec) op.RunError!u32 {
         for (0..constants.io_syscall_retry_max) |_| {
             const rc = System.kevent(
@@ -243,7 +230,6 @@ pub const Kqueue = struct {
             );
             switch (std.posix.errno(rc)) {
                 .SUCCESS => {
-                    // The kernel has taken them, whether or not anything fired.
                     self.change_count = 0;
 
                     const event_count: u32 = @intCast(rc);
@@ -281,9 +267,6 @@ pub const Kqueue = struct {
     // Submission
     // -----------------------------------------------------------------------
 
-    /// Builds the erased callback for one operation kind and submits it. The
-    /// caller's typed callback takes a result, except for `close`, whose
-    /// payload carries none.
     fn submitOperation(
         self: *Kqueue,
         comptime tag: std.meta.Tag(op.Operation),
@@ -393,7 +376,6 @@ pub const Kqueue = struct {
                 .fd = send_operation.fd,
                 .filter = System.EVFILT.WRITE,
             },
-            // Closing never blocks, so it is never armed.
             .close => unreachable,
         };
     }
@@ -418,7 +400,6 @@ pub const Kqueue = struct {
                     return .completed;
                 },
                 .INTR => continue,
-                // No connection waiting, or the client vanished before accept.
                 .AGAIN, .CONNABORTED => return .io_pending,
                 .MFILE => {
                     operation.result = error.ProcessFdQuotaExceeded;
@@ -445,7 +426,6 @@ pub const Kqueue = struct {
         for (0..constants.io_syscall_retry_max) |_| {
             const rc = System.read(operation.fd, operation.buffer.ptr, operation.buffer.len);
             switch (std.posix.errno(rc)) {
-                // A count of 0 means the peer closed: a result, not an error.
                 .SUCCESS => {
                     operation.result = @intCast(rc);
                     return .completed;
@@ -507,8 +487,6 @@ pub const Kqueue = struct {
     // Socket setup
     // -----------------------------------------------------------------------
 
-    /// Accepted sockets are non-blocking on every platform, and never raise
-    /// SIGPIPE: macOS inherits the first flag from the listener, Linux does not.
     fn configureAccepted(fd: System.fd_t) op.AcceptError!void {
         assert(fd > -1);
 
@@ -516,8 +494,6 @@ pub const Kqueue = struct {
         try disableSigPipe(fd);
     }
 
-    /// Callers put their own descriptors (a listener, say) into the mode the
-    /// loop requires before handing them over.
     pub fn setNonBlocking(fd: System.fd_t) op.AcceptError!void {
         const flags = try fileFlags(fd);
         const nonblocking: usize = 1 << @bitOffsetOf(System.O, "NONBLOCK");

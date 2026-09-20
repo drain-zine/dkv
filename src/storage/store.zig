@@ -5,15 +5,11 @@ const Allocator = std.mem.Allocator;
 const wal = @import("wal.zig");
 
 pub const Startup = enum {
-    /// Rebuild memory from the existing log, then keep appending to it.
     replay,
-    /// Erase the existing log and start empty. Nothing written before this
-    /// start can come back on a later replay.
     discard,
 };
 
 pub const Options = struct {
-    /// Directory the log lives in.
     dir: Io.Dir,
     wal_path: []const u8 = "dkv.wal",
     wal: wal.Options = .{},
@@ -27,6 +23,18 @@ pub const Store = struct {
     wal: wal.Wal,
 
     const Map = std.StringHashMapUnmanaged([]const u8);
+
+    const Replayer = struct {
+        gpa: Allocator,
+        map: *Map,
+
+        pub fn apply(self: *Replayer, body: wal.Body) wal.Sink.Error!void {
+            switch (body.op) {
+                .put => try applyPut(self.gpa, self.map, body.key, body.value),
+                .remove => _ = applyRemove(self.gpa, self.map, body.key),
+            }
+        }
+    };
 
     pub fn init(gpa: Allocator, io: Io, options: Options) !Store {
         var map: Map = .empty;
@@ -58,39 +66,24 @@ pub const Store = struct {
         return self.map.get(key);
     }
 
-    /// Logs first, then applies. Panics if either step fails, because the log
-    /// and memory would no longer agree.
     pub fn put(self: *Store, key: []const u8, value: []const u8) void {
         _ = self.wal.append(.put, key, value) catch |err| fatal("put: log append", err);
         applyPut(self.gpa, &self.map, key, value) catch |err| fatal("put: apply", err);
     }
 
-    /// Returns whether the key existed. Logs even when it did not, so replay
-    /// stays a faithful history rather than depending on state at the time.
-    /// Panics if logging fails.
     pub fn remove(self: *Store, key: []const u8) bool {
         _ = self.wal.append(.remove, key, "") catch |err| fatal("remove: log append", err);
         return applyRemove(self.gpa, &self.map, key);
     }
 
-    fn fatal(operation: []const u8, err: anyerror) noreturn {
-        std.debug.panic("store {s} failed: {s}", .{ operation, @errorName(err) });
+    pub fn needsCommit(self: *const Store) bool {
+        return self.wal.needsSync();
     }
 
-    /// Applies replayed records to the map without logging them again.
-    const Replayer = struct {
-        gpa: Allocator,
-        map: *Map,
+    pub fn commit(self: *Store) void {
+        self.wal.sync() catch |err| fatal("commit", err);
+    }
 
-        pub fn apply(self: *Replayer, body: wal.Body) wal.Sink.Error!void {
-            switch (body.op) {
-                .put => try applyPut(self.gpa, self.map, body.key, body.value),
-                .remove => _ = applyRemove(self.gpa, self.map, body.key),
-            }
-        }
-    };
-
-    /// The map owns copies of every key and value it holds.
     fn applyPut(gpa: Allocator, map: *Map, key: []const u8, value: []const u8) !void {
         const owned_value = try gpa.dupe(u8, value);
         errdefer gpa.free(owned_value);
@@ -120,6 +113,10 @@ pub const Store = struct {
         }
         map.deinit(gpa);
     }
+
+    fn fatal(operation: []const u8, err: anyerror) noreturn {
+        std.debug.panic("store {s} failed: {s}", .{ operation, @errorName(err) });
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -140,7 +137,7 @@ test "put, get, remove, and survive a restart" {
 
         store.put("a", "1");
         store.put("b", "2");
-        store.put("a", "one"); // overwrite frees the old value
+        store.put("a", "one");
         try testing.expectEqualStrings("one", store.get("a").?);
         try testing.expect(store.remove("b"));
         try testing.expect(!store.remove("b"));
@@ -173,7 +170,6 @@ test "discard startup erases the log instead of hiding it" {
         store.put("c", "3");
     }
 
-    // A later replaying start sees only what was written after the discard.
     var store = try Store.init(testing.allocator, io, .{ .dir = tmp.dir });
     defer store.deinit();
     try testing.expectEqual(1, store.count());

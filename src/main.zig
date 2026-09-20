@@ -27,6 +27,7 @@ test {
     _ = @import("ring_buffer.zig");
     _ = @import("server.zig");
 
+    _ = @import("io/descriptor.zig");
     _ = @import("io/kqueue.zig");
     _ = @import("protocol/command_loop.zig");
     _ = @import("protocol/resp.zig");

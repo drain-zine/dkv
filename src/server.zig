@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 const System = std.posix.system;
 
 const constants = @import("constants.zig");
-const io_module = @import("io/io.zig");
+const io_module = @import("io/event.zig");
 const Io = io_module.Io;
 const Connection = @import("connection.zig").Connection;
 const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
@@ -15,8 +15,6 @@ const log = std.log.scoped(.server);
 
 pub const Options = struct { host: []const u8, port: u16 };
 
-/// Accepts connections and hands each one a slot. Everything after accept is
-/// the connection's own business: the server never touches a descriptor again.
 pub const Server = struct {
     gpa: Allocator,
     std_io: StdIo,
@@ -33,7 +31,10 @@ pub const Server = struct {
     accept_completion: Io.Completion = undefined,
     accept_in_flight: bool = false,
 
-    /// All memory the server uses is allocated here, once.
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
     pub fn init(gpa: Allocator, std_io: StdIo, store: *Store, options: Options) !Server {
         const connection_count = constants.connection_count_max;
         const request_buffer_size = constants.connection_request_buffer_size;
@@ -79,17 +80,12 @@ pub const Server = struct {
         };
     }
 
-    /// Submits the first accept. Separate from `init` because a completion
-    /// stores the server's address, which only settles once `init` returns.
     pub fn start(self: *Server) void {
         assert(!self.accept_in_flight);
 
         self.submitAccept();
     }
 
-    /// Frees everything and closes every descriptor still open. The event queue
-    /// itself is left to the exiting process: a completion armed against a
-    /// closed descriptor never fires, so there is nothing to drain it with.
     pub fn deinit(self: *Server) void {
         for (self.connections) |*connection| {
             if (connection.fd > -1) _ = System.close(connection.fd);
@@ -102,15 +98,32 @@ pub const Server = struct {
         self.* = undefined;
     }
 
-    /// Serves until something goes wrong with the event queue itself. A failing
-    /// client only ends its own connection.
+    // -----------------------------------------------------------------------
+    // Serving
+    // -----------------------------------------------------------------------
+
     pub fn run(self: *Server) !void {
         const timeout = constants.event_loop_wait_timeout_ms * std.time.ns_per_ms;
 
         while (true) {
             try self.io.runForNs(timeout);
+            self.commit();
         }
     }
+
+    fn commit(self: *Server) void {
+        if (!self.store.needsCommit()) return;
+
+        self.store.commit();
+
+        for (self.connections) |*connection| {
+            if (connection.commit_pending) connection.releaseResponse();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Accepting
+    // -----------------------------------------------------------------------
 
     fn submitAccept(self: *Server) void {
         assert(!self.accept_in_flight);
@@ -136,8 +149,6 @@ pub const Server = struct {
         self.accept_in_flight = false;
 
         const fd = result catch |err| {
-            // Running out of descriptors would spin: the listener stays ready,
-            // so re-arming fails again immediately. Wait for a slot to free up.
             switch (err) {
                 error.ProcessFdQuotaExceeded, error.SystemResources => {
                     log.warn("accept deferred: {s}", .{@errorName(err)});
@@ -154,7 +165,6 @@ pub const Server = struct {
         if (self.acquireConnection()) |connection| {
             connection.open(&self.io, self.store, fd);
         } else {
-            // Best effort: the refusal is worth a try, but never worth a retry.
             log.warn("no free connection slot, refusing client", .{});
             const reply = &CommandLoop.reject_busy_reply;
             _ = System.write(fd, reply, reply.len);
@@ -172,3 +182,158 @@ pub const Server = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+const Harness = struct {
+    tmp: testing.TmpDir,
+    store: Store,
+    server: Server,
+
+    const pass_timeout_ns = 1 * std.time.ns_per_ms;
+    const pass_count_max = 2000;
+
+    fn init(self: *Harness) !void {
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+
+        self.store = try Store.init(testing.allocator, testing.io, .{
+            .dir = self.tmp.dir,
+            .wal = .{ .durability = .never },
+        });
+        errdefer self.store.deinit();
+
+        self.server = try Server.init(testing.allocator, testing.io, &self.store, .{
+            .host = "127.0.0.1",
+            .port = 0,
+        });
+        self.server.start();
+    }
+
+    fn deinit(self: *Harness) void {
+        _ = System.close(self.server.io.kqueue_fd);
+        self.server.deinit();
+        self.store.deinit();
+        self.tmp.cleanup();
+    }
+
+    fn run(self: *Harness, pass_count: usize) void {
+        for (0..pass_count) |_| self.server.io.runForNs(pass_timeout_ns) catch unreachable;
+    }
+
+    fn connect(self: *Harness) !System.fd_t {
+        const address = self.server.listener.socket.address;
+        const stream = try address.connect(testing.io, .{ .mode = .stream });
+
+        try Io.setNonBlocking(stream.socket.handle);
+        return stream.socket.handle;
+    }
+
+    fn send(self: *Harness, fd: System.fd_t, bytes: []const u8) void {
+        var size_sent: usize = 0;
+
+        for (0..pass_count_max) |_| {
+            if (size_sent == bytes.len) return;
+
+            const rc = System.write(fd, bytes.ptr + size_sent, bytes.len - size_sent);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => size_sent += @intCast(rc),
+                .AGAIN => self.run(1),
+                else => unreachable,
+            }
+        }
+
+        unreachable;
+    }
+
+    fn expectReply(self: *Harness, fd: System.fd_t, expected: []const u8) !void {
+        const buffer = try testing.allocator.alloc(u8, expected.len);
+        defer testing.allocator.free(buffer);
+
+        var size_received: usize = 0;
+        for (0..pass_count_max) |_| {
+            if (size_received == expected.len) break;
+
+            const rc = System.read(fd, buffer.ptr + size_received, expected.len - size_received);
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => {
+                    if (rc == 0) break;
+                    size_received += @intCast(rc);
+                },
+                .AGAIN => self.run(1),
+                else => unreachable,
+            }
+        }
+
+        try testing.expectEqualStrings(expected, buffer[0..size_received]);
+    }
+};
+
+test "a client is accepted and replied to over a real socket" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+
+    const client = try harness.connect();
+    defer _ = System.close(client);
+
+    harness.send(client, "PING\r\n");
+    try harness.expectReply(client, "+PONG\r\n");
+}
+
+test "a value set over the wire reads back" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+
+    const client = try harness.connect();
+    defer _ = System.close(client);
+
+    harness.send(client, "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+    try harness.expectReply(client, "+OK\r\n");
+
+    harness.send(client, "*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
+    try harness.expectReply(client, "$1\r\n1\r\n");
+}
+
+test "pipelined commands reply in order" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+
+    const client = try harness.connect();
+    defer _ = System.close(client);
+
+    harness.send(
+        client,
+        "*1\r\n$4\r\nPING\r\n" ++
+            "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n" ++
+            "*2\r\n$3\r\nGET\r\n$1\r\na\r\n",
+    );
+
+    try harness.expectReply(client, "+PONG\r\n+OK\r\n$1\r\n1\r\n");
+}
+
+test "two clients are served independently" {
+    var harness: Harness = undefined;
+    try harness.init();
+    defer harness.deinit();
+
+    const first = try harness.connect();
+    defer _ = System.close(first);
+    const second = try harness.connect();
+    defer _ = System.close(second);
+
+    harness.send(first, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\nhi\r\n");
+    try harness.expectReply(first, "+OK\r\n");
+
+    harness.send(second, "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    try harness.expectReply(second, "$2\r\nhi\r\n");
+
+    harness.send(first, "PING\r\n");
+    try harness.expectReply(first, "+PONG\r\n");
+}

@@ -4,18 +4,13 @@ const StdIo = std.Io;
 const System = std.posix.system;
 
 const constants = @import("constants.zig");
-const io_module = @import("io/io.zig");
+const io_module = @import("io/event.zig");
 const Io = io_module.Io;
 const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
 const Store = @import("storage/store.zig").Store;
 
 const log = std.log.scoped(.connection);
 
-/// One client. Owns its descriptor, its buffers and the two completions it
-/// keeps in flight, so the server never touches a descriptor after accept.
-///
-/// Completions are embedded, so a connection must not move while an operation
-/// is in flight. The server's slots are allocated once and never resized.
 pub const Connection = struct {
     state: State = .free,
     fd: System.fd_t = -1,
@@ -29,17 +24,24 @@ pub const Connection = struct {
     response_buffer: []u8,
     response_size: u32 = 0,
     response_size_sent: u32 = 0,
+    commit_pending: bool = false,
 
     recv_completion: Io.Completion = undefined,
     send_completion: Io.Completion = undefined,
     recv_in_flight: bool = false,
     send_in_flight: bool = false,
 
+    // -----------------------------------------------------------------------
+    // Types
+    // -----------------------------------------------------------------------
+
     pub const State = enum { free, open, closing };
 
-    /// Takes over `fd` and starts reading from it.
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
     pub fn open(self: *Connection, io: *Io, store: *Store, fd: System.fd_t) void {
-        // `io` and `store` outlive every connection: the server owns both.
         assert(self.state == .free);
         assert(self.fd == -1);
         assert(!self.recv_in_flight);
@@ -54,17 +56,51 @@ pub const Connection = struct {
         self.request_size = 0;
         self.response_size = 0;
         self.response_size_sent = 0;
+        self.commit_pending = false;
         self.recv_completion.state = .unused;
         self.send_completion.state = .unused;
 
         self.submitRecv();
     }
 
-    /// True once the descriptor is closed and both completions are back, so
-    /// the server may hand this slot to another client.
     pub fn isFinished(self: *const Connection) bool {
         return self.state == .free;
     }
+
+    // -----------------------------------------------------------------------
+    // Driving
+    // -----------------------------------------------------------------------
+
+    fn advance(self: *Connection) void {
+        if (self.state == .open and
+            self.request_size > 0 and
+            self.response_size == 0)
+        {
+            self.processRequest();
+        }
+
+        if (self.hasPendingResponse() and !self.send_in_flight and !self.commit_pending) {
+            self.submitSend();
+        }
+
+        switch (self.state) {
+            .open => {
+                const room = self.request_size < self.request_buffer.len;
+                if (room and !self.recv_in_flight) self.submitRecv();
+            },
+            .closing => self.closeWhenDrained(),
+            .free => {},
+        }
+    }
+
+    pub fn releaseResponse(self: *Connection) void {
+        self.commit_pending = false;
+        self.advance();
+    }
+
+    // -----------------------------------------------------------------------
+    // Receiving
+    // -----------------------------------------------------------------------
 
     fn submitRecv(self: *Connection) void {
         assert(self.state == .open);
@@ -95,18 +131,18 @@ pub const Connection = struct {
             log.debug("recv failed: {s}", .{@errorName(err)});
             return self.beginClose();
         };
-        // Zero bytes means the peer shut its side down, not an error.
         if (received == 0) return self.beginClose();
 
         self.request_size += @intCast(received);
         assert(self.request_size <= self.request_buffer.len);
 
-        self.resume_();
+        self.advance();
     }
 
-    /// Runs whatever whole commands have arrived, keeping any partial command
-    /// for the next read. Replies that do not fit are left for a later call,
-    /// once what is already encoded has been sent.
+    // -----------------------------------------------------------------------
+    // Running commands
+    // -----------------------------------------------------------------------
+
     fn processRequest(self: *Connection) void {
         assert(self.state == .open);
         assert(self.request_size > 0);
@@ -132,34 +168,13 @@ pub const Connection = struct {
         );
         self.request_size = remaining;
 
+        self.commit_pending = outcome.commit_required;
         if (outcome.close) self.state = .closing;
     }
 
-    /// Keeps the connection moving: run what has arrived, send what is pending,
-    /// read more if there is room, and close once a closing connection has
-    /// drained. A reply held back for want of room is encoded here, one drained
-    /// response buffer at a time.
-    fn resume_(self: *Connection) void {
-        if (self.state == .open and
-            self.request_size > 0 and
-            self.response_size == 0)
-        {
-            self.processRequest();
-        }
-
-        if (self.hasPendingResponse() and !self.send_in_flight) {
-            self.submitSend();
-        }
-
-        switch (self.state) {
-            .open => {
-                const room = self.request_size < self.request_buffer.len;
-                if (room and !self.recv_in_flight) self.submitRecv();
-            },
-            .closing => self.closeWhenDrained(),
-            .free => {},
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Sending
+    // -----------------------------------------------------------------------
 
     fn hasPendingResponse(self: *const Connection) bool {
         assert(self.response_size_sent <= self.response_size);
@@ -170,6 +185,7 @@ pub const Connection = struct {
         assert(self.state != .free);
         assert(!self.send_in_flight);
         assert(self.hasPendingResponse());
+        assert(!self.commit_pending);
 
         self.send_in_flight = true;
         self.io.send(
@@ -201,14 +217,17 @@ pub const Connection = struct {
         self.response_size_sent += @intCast(sent);
         assert(self.response_size_sent <= self.response_size);
 
-        // Everything queued has gone out, so the buffer starts again.
         if (!self.hasPendingResponse()) {
             self.response_size = 0;
             self.response_size_sent = 0;
         }
 
-        self.resume_();
+        self.advance();
     }
+
+    // -----------------------------------------------------------------------
+    // Closing
+    // -----------------------------------------------------------------------
 
     fn beginClose(self: *Connection) void {
         assert(self.state != .free);
@@ -217,8 +236,6 @@ pub const Connection = struct {
         self.closeWhenDrained();
     }
 
-    /// A closing connection still sends what it has already encoded, so a
-    /// protocol error reaches the client before the descriptor goes away.
     fn closeWhenDrained(self: *Connection) void {
         assert(self.state == .closing);
 
@@ -246,5 +263,6 @@ pub const Connection = struct {
         self.request_size = 0;
         self.response_size = 0;
         self.response_size_sent = 0;
+        self.commit_pending = false;
     }
 };

@@ -1,9 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-/// Fixed-capacity FIFO. Storage lives inside the struct, so nothing is
-/// allocated and elements never move. `capacity` must be a power of two, which
-/// makes wrapping a mask rather than a division.
 pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
     comptime assert(capacity > 0);
     comptime assert(capacity & (capacity - 1) == 0);
@@ -35,8 +32,6 @@ pub fn RingBuffer(comptime T: type, comptime capacity: usize) type {
             return entry;
         }
 
-        /// Moves every entry into `out`, oldest first, leaving the ring empty.
-        /// Entries pushed after this call land behind them.
         pub fn drain(self: *Self, out: []T) []T {
             const count = self.count;
             assert(out.len >= count);
@@ -86,7 +81,6 @@ test "a full ring still wraps correctly" {
     for (0..4) |value| ring.push(@intCast(value));
     try testing.expectEqual(@as(usize, 4), ring.count);
 
-    // Drop the two oldest, then refill the space they freed.
     try testing.expectEqual(@as(u32, 0), ring.pop().?);
     try testing.expectEqual(@as(u32, 1), ring.pop().?);
     ring.push(4);

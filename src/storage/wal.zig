@@ -1,10 +1,3 @@
-//! Write-ahead log.
-//!
-//! On-disk format: a sequence of records, each a fixed `Header` followed by
-//! `key_len` bytes of key and the remaining bytes of value. The CRC covers
-//! everything after the `len` field. Replay stops at the first record that is
-//! short, has impossible lengths, or fails its CRC; that point is the torn
-//! tail from a crash and gets truncated on the next `open`.
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
@@ -12,40 +5,35 @@ const Allocator = std.mem.Allocator;
 const Crc32c = std.hash.crc.Crc32Iscsi;
 
 const constants = @import("../constants.zig");
+const descriptor = @import("../io/descriptor.zig");
+
+// ---------------------------------------------------------------------------
+// On-disk format
+// ---------------------------------------------------------------------------
 
 pub const Operation = enum(u8) { put = 1, remove = 2 };
 
-pub const Durability = enum {
-    /// Every append is flushed and synced before it returns.
-    always,
-    /// Appends are buffered; the log is synced at most once per second,
-    /// checked lazily on the next append. Up to one second of acknowledged
-    /// writes can be lost on crash.
-    everysec,
-    /// Never synced explicitly. Flushed only when the buffer fills or on close.
-    never,
-};
-
 pub const Header = extern struct {
     crc32c: u32,
-    /// Number of bytes after this field: the rest of the header plus the body.
     len: u32,
     seq: u64,
-    /// `Operation` as a raw byte so a corrupt value can be rejected on read.
     op: u8,
     _pad: [3]u8 = .{ 0, 0, 0 },
     key_len: u32,
 
-    /// Bytes of the header that are covered by `len` and by the CRC.
-    pub const covered = @sizeOf(Header) - 8;
+    pub const prefix_size = @sizeOf(u32) * 2;
+
+    pub const covered = @sizeOf(Header) - prefix_size;
 };
 
 comptime {
     assert(@sizeOf(Header) == 24);
 }
 
-/// A decoded record. Slices point into a buffer owned by the `Reader` and are
-/// only valid until its next call.
+// ---------------------------------------------------------------------------
+// Recovered records
+// ---------------------------------------------------------------------------
+
 pub const Body = struct {
     seq: u64,
     op: Operation,
@@ -53,20 +41,12 @@ pub const Body = struct {
     value: []const u8,
 };
 
-/// Receives every record recovered by `Wal.open`. Build one with `Sink.from`.
-///
-/// This is a type-erased interface in the style of `std.mem.Allocator`: a
-/// context pointer plus a function pointer, so `open` takes a concrete type
-/// and a sink can be absent at runtime.
 pub const Sink = struct {
     context: *anyopaque,
     apply_fn: *const fn (context: *anyopaque, body: Body) Error!void,
 
     pub const Error = error{OutOfMemory};
 
-    /// Wraps `pointer`, whose type must declare
-    /// `pub fn apply(self: *T, body: Body) Sink.Error!void`.
-    /// Anything else is rejected at compile time with a message naming `T`.
     pub fn from(comptime T: type, pointer: *T) Sink {
         comptime check(T);
         const erased = struct {
@@ -78,8 +58,6 @@ pub const Sink = struct {
         return .{ .context = pointer, .apply_fn = erased.apply };
     }
 
-    /// Hands one record to the wrapped value. The `Body` slices are only
-    /// valid for the duration of this call.
     pub fn apply(self: Sink, body: Body) Error!void {
         return self.apply_fn(self.context, body);
     }
@@ -106,20 +84,29 @@ pub const Sink = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+pub const Durability = enum {
+    always,
+    never,
+};
+
 pub const Options = struct {
     durability: Durability = .always,
-    /// Truncate an existing log to empty on open instead of recovering it.
     discard_existing: bool = false,
 };
 
-/// Reads records sequentially from the start of a log file.
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
 pub const Reader = struct {
     file_reader: Io.File.Reader,
     body: std.ArrayList(u8),
     gpa: Allocator,
-    /// Offset just past the last good record.
     valid_end: u64 = 0,
-    /// Sequence number of the last good record, 0 if none.
     last_seq: u64 = 0,
 
     pub fn init(file: Io.File, io: Io, buffer: []u8, gpa: Allocator) Reader {
@@ -134,12 +121,11 @@ pub const Reader = struct {
         self.body.deinit(self.gpa);
     }
 
-    /// Returns null at the end of valid data. Real IO failures are errors.
     pub fn next(self: *Reader) !?Body {
         const stream = &self.file_reader.interface;
 
         const header: Header = (stream.takeStructPointer(Header) catch |err| switch (err) {
-            error.EndOfStream => return null, // short header: torn tail
+            error.EndOfStream => return null,
             else => return err,
         }).*;
 
@@ -151,7 +137,7 @@ pub const Reader = struct {
         const body = (try self.readBody(body_len)) orelse return null;
 
         var hash = Crc32c.init();
-        hash.update(std.mem.asBytes(&header)[8..]);
+        hash.update(std.mem.asBytes(&header)[Header.prefix_size..]);
         hash.update(body);
         if (hash.final() != header.crc32c) return null;
 
@@ -167,9 +153,6 @@ pub const Reader = struct {
         };
     }
 
-    /// Null when the body is short, which is a torn tail rather than a failure.
-    /// A body that fits the read buffer is borrowed from it; a larger one is
-    /// staged in `body`, which grows to the largest record seen.
     fn readBody(self: *Reader, body_len: u32) !?[]const u8 {
         const stream = &self.file_reader.interface;
 
@@ -189,22 +172,25 @@ pub const Reader = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Writing
+// ---------------------------------------------------------------------------
+
 pub const Wal = struct {
     file: Io.File,
     io: Io,
     gpa: Allocator,
     buffer: []u8,
     writer: Io.File.Writer,
-    next_seq: u64,
     durability: Durability,
-    last_sync: Io.Timestamp,
 
-    /// Opens or creates the log at `path` relative to `dir`, replays every
-    /// valid record into `sink`, truncates any torn tail, and positions the
-    /// writer to append.
-    ///
-    /// Pass `null` as `sink` to recover the log position without applying
-    /// the records anywhere.
+    last_seq: u64 = 0,
+    last_durable_seq: u64 = 0,
+
+    // -----------------------------------------------------------------------
+    // Lifecycle
+    // -----------------------------------------------------------------------
+
     pub fn open(
         gpa: Allocator,
         io: Io,
@@ -218,21 +204,17 @@ pub const Wal = struct {
             .truncate = options.discard_existing,
         });
         errdefer file.close(io);
-        // Make the truncation durable before anything new is acknowledged.
         if (options.discard_existing) try file.sync(io);
 
         const buffer = try gpa.alloc(u8, constants.wal_buffer_size);
         errdefer gpa.free(buffer);
 
-        // Recovery pass. Reuse the write buffer for reading since the writer
-        // has not started yet.
         var reader = Reader.init(file, io, buffer, gpa);
         defer reader.deinit();
         while (try reader.next()) |body| {
             if (sink) |target| try target.apply(body);
         }
 
-        // Drop any torn tail so a plain sequential read never sees it.
         const size = (try file.stat(io)).size;
         if (size != reader.valid_end) try file.setLength(io, reader.valid_end);
 
@@ -242,30 +224,28 @@ pub const Wal = struct {
             .gpa = gpa,
             .buffer = buffer,
             .writer = file.writer(io, buffer),
-            .next_seq = reader.last_seq + 1,
             .durability = options.durability,
-            .last_sync = Io.Timestamp.now(io, .awake),
+            .last_seq = reader.last_seq,
+            .last_durable_seq = reader.last_seq,
         };
         try wal.writer.seekTo(reader.valid_end);
         return wal;
     }
 
     pub fn close(self: *Wal) void {
-        self.writer.flush() catch {};
-        if (self.durability != .always) self.file.sync(self.io) catch {};
+        self.sync() catch {};
         self.file.close(self.io);
         self.gpa.free(self.buffer);
     }
 
-    /// Writes one record and returns its sequence number. With `.always`
-    /// durability the record is on disk when this returns. On error nothing
-    /// should be applied to the in-memory state.
+    // -----------------------------------------------------------------------
+    // Appending
+    // -----------------------------------------------------------------------
+
     pub fn append(self: *Wal, op: Operation, key: []const u8, value: []const u8) !u64 {
-        // A record larger than this replays as a torn tail, so it would be
-        // written now and silently lost on the next open.
         assert(Header.covered + key.len + value.len <= constants.wal_record_size_max);
 
-        const seq = self.next_seq;
+        const seq = self.last_seq + 1;
 
         var header: Header = .{
             .crc32c = 0,
@@ -276,7 +256,7 @@ pub const Wal = struct {
         };
 
         var hash = Crc32c.init();
-        hash.update(std.mem.asBytes(&header)[8..]);
+        hash.update(std.mem.asBytes(&header)[Header.prefix_size..]);
         hash.update(key);
         hash.update(value);
         header.crc32c = hash.final();
@@ -286,25 +266,27 @@ pub const Wal = struct {
         try stream.writeAll(key);
         try stream.writeAll(value);
 
-        switch (self.durability) {
-            .always => try self.sync(),
-            .everysec => {
-                const now = Io.Timestamp.now(self.io, .awake);
-                const since_sync = self.last_sync.durationTo(now).nanoseconds;
-                if (since_sync >= std.time.ns_per_s) try self.sync();
-            },
-            .never => {},
-        }
-
-        self.next_seq += 1;
+        self.last_seq = seq;
         return seq;
     }
 
-    /// Pushes buffered records to the OS and asks the OS to push them to disk.
+    // -----------------------------------------------------------------------
+    // Durability
+    // -----------------------------------------------------------------------
+
+    pub fn needsSync(self: *const Wal) bool {
+        assert(self.last_durable_seq <= self.last_seq);
+
+        return self.durability == .always and self.last_seq > self.last_durable_seq;
+    }
+
     pub fn sync(self: *Wal) !void {
+        assert(self.last_durable_seq <= self.last_seq);
+
         try self.writer.flush();
-        try self.file.sync(self.io);
-        self.last_sync = Io.Timestamp.now(self.io, .awake);
+        try descriptor.syncBarrier(self.file.handle);
+
+        self.last_durable_seq = self.last_seq;
     }
 };
 
@@ -362,7 +344,7 @@ test "append then replay" {
     );
     defer wal.close();
 
-    try testing.expectEqual(4, wal.next_seq);
+    try testing.expectEqual(3, wal.last_seq);
     const entries = collector.entries.items;
     try testing.expectEqual(3, entries.len);
     try testing.expectEqual(.put, entries[0].op);
@@ -387,8 +369,6 @@ test "torn tail is dropped and truncated" {
         try wal.sync();
         good_size = (try wal.file.stat(io)).size;
 
-        // Simulate a crash mid-write: a header with a plausible length but
-        // no body behind it, then some garbage.
         const stream = &wal.writer.interface;
         const header_torn: Header = .{
             .crc32c = 0,
@@ -414,10 +394,9 @@ test "torn tail is dropped and truncated" {
     defer wal.close();
 
     try testing.expectEqual(2, collector.entries.items.len);
-    try testing.expectEqual(3, wal.next_seq);
+    try testing.expectEqual(2, wal.last_seq);
     try testing.expectEqual(good_size, (try wal.file.stat(io)).size);
 
-    // Appending after recovery lands right after the last good record.
     try testing.expectEqual(3, try wal.append(.put, "c", "3"));
 }
 
@@ -434,11 +413,10 @@ test "corrupted byte in the middle stops replay there" {
         _ = try wal.append(.put, "c", "3");
     }
 
-    // Flip a byte inside the second record's value.
     {
         const file = try tmp.dir.openFile(io, "test.wal", .{ .mode = .read_write });
         defer file.close(io);
-        const offset = 2 * @sizeOf(Header) + 1 + 1; // second record's value byte
+        const offset = 2 * @sizeOf(Header) + 1 + 1;
         try file.writePositionalAll(io, "X", offset);
     }
 
@@ -455,5 +433,28 @@ test "corrupted byte in the middle stops replay there" {
     defer wal.close();
 
     try testing.expectEqual(1, collector.entries.items.len);
-    try testing.expectEqual(2, wal.next_seq);
+    try testing.expectEqual(1, wal.last_seq);
+}
+
+test "always defers the barrier, and one sync covers every append before it" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var wal = try Wal.open(testing.allocator, io, tmp.dir, "test.wal", .{}, null);
+    defer wal.close();
+
+    try testing.expect(!wal.needsSync());
+
+    _ = try wal.append(.put, "a", "1");
+    _ = try wal.append(.put, "b", "2");
+
+    try testing.expectEqual(2, wal.last_seq);
+    try testing.expectEqual(0, wal.last_durable_seq);
+    try testing.expect(wal.needsSync());
+
+    try wal.sync();
+
+    try testing.expectEqual(2, wal.last_durable_seq);
+    try testing.expect(!wal.needsSync());
 }

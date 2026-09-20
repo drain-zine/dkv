@@ -6,13 +6,11 @@ const constants = @import("../constants.zig");
 const terminator = "\r\n";
 
 pub const Prefix = enum(u8) {
-    // RESP2
     simple_string = '+',
     simple_error = '-',
     integer = ':',
     bulk_string = '$',
     array = '*',
-    // RESP3
     null_value = '_',
     boolean = '#',
     double = ',',
@@ -34,7 +32,6 @@ pub const Command = struct {
     arguments: [constants.resp_argument_count_max][]const u8 = undefined,
     argument_count: u32 = 0,
 
-    /// Input bytes this command occupied, so the caller can advance past it.
     size: u32 = 0,
 
     pub fn name(self: *const Command) []const u8 {
@@ -49,12 +46,6 @@ pub const DecodeError = error{
     ArgumentTooLarge,
 };
 
-/// Decodes the command at the front of `input` and sets `command.size` to the
-/// bytes it occupied. `error.Incomplete` means `input` holds a valid prefix:
-/// keep those bytes and call again once more have arrived.
-///
-/// Every slice in `command.arguments` points into `input`, so it stays valid
-/// only until that buffer is refilled. Anything kept must be copied.
 pub fn decode(input: []const u8, command: *Command) DecodeError!void {
     command.argument_count = 0;
 
@@ -63,7 +54,6 @@ pub fn decode(input: []const u8, command: *Command) DecodeError!void {
     return decodeArray(input, command);
 }
 
-/// A plain line of space separated words, as typed into telnet or netcat.
 fn decodeInline(input: []const u8, command: *Command) DecodeError!void {
     const line, const size = try readLine(input, 0);
     if (line.len > constants.resp_inline_size_max) return error.Protocol;
@@ -118,10 +108,6 @@ fn readLine(input: []const u8, offset: usize) DecodeError!struct { []const u8, u
 
 // ---------------------------------------------------------------------------
 // Encoding
-//
-// Replies are written straight into a `std.Io.Writer`: a connection wraps its
-// response buffer in one, tests use a fixed buffer. Nothing allocates, and a
-// buffer with no room left surfaces as `error.WriteFailed`.
 // ---------------------------------------------------------------------------
 
 pub const Reply = union(enum) {
@@ -172,7 +158,6 @@ fn encodeErrorNamed(
     try encodeError(writer, message);
 }
 
-/// `+OK\r\n`. The value is chosen by the server and must not contain CR or LF.
 fn encodeSimpleString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
     assert(std.mem.findAny(u8, value, terminator) == null);
 
@@ -181,8 +166,6 @@ fn encodeSimpleString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.E
     try writer.writeAll(terminator);
 }
 
-/// `-ERR unknown command\r\n`. The caller passes the whole message, error code
-/// included. It may echo client input, so each CR or LF is written as a space.
 fn encodeError(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.Error!void {
     assert(message.len > 0);
 
@@ -194,24 +177,20 @@ fn encodeError(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.Error!
     try writer.writeAll(terminator);
 }
 
-/// `:42\r\n`.
 fn encodeInteger(writer: *std.Io.Writer, value: i64) std.Io.Writer.Error!void {
     try writer.print(":{d}" ++ terminator, .{value});
 }
 
-/// `$5\r\nhello\r\n`. Length prefixed, so any bytes are allowed.
 fn encodeBulkString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
     try writer.print("${d}" ++ terminator, .{value.len});
     try writer.writeAll(value);
     try writer.writeAll(terminator);
 }
 
-/// `$-1\r\n`. The RESP2 null, e.g. GET on a missing key.
 fn encodeNull(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll("$-1" ++ terminator);
 }
 
-/// `*2\r\n`. Must be followed by exactly `count` encoded elements.
 fn encodeArrayHeader(writer: *std.Io.Writer, count: u32) std.Io.Writer.Error!void {
     try writer.print("*{d}" ++ terminator, .{count});
 }
@@ -249,7 +228,6 @@ test "one command with arguments" {
 test "arguments are binary safe and may be empty" {
     var command: Command = .{};
 
-    // The value is four bytes and contains the terminator itself.
     try decode("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\na\r\nb\r\n", &command);
     try testing.expectEqualStrings("a\r\nb", command.arguments[2]);
 
@@ -282,10 +260,8 @@ test "pipelined commands are decoded one at a time" {
     var decoded_count: usize = 0;
     var offset: usize = 0;
 
-    // This is the drain loop a connection runs after every read.
     while (offset < input.len) {
         try decode(input[offset..], &command);
-        // A decoder reporting zero bytes would spin here forever.
         try testing.expect(command.size > 0);
         try testing.expect(decoded_count < names.len);
         names[decoded_count] = command.arguments[0];
@@ -314,22 +290,16 @@ test "a trailing partial command is left for the next read" {
 test "broken framing is a protocol error, so the connection must close" {
     var command: Command = .{};
 
-    // An element that is not a bulk string.
     try testing.expectError(error.Protocol, decode("*1\r\n+OK\r\n", &command));
-    // A null array is a reply, never a request.
     try testing.expectError(error.Protocol, decode("*-1\r\n", &command));
-    // A null bulk string is not a valid argument.
     try testing.expectError(error.Protocol, decode("*1\r\n$-1\r\n", &command));
-    // A length that is not a number.
     try testing.expectError(error.Protocol, decode("*x\r\n", &command));
-    // Data not followed by the terminator.
     try testing.expectError(error.Protocol, decode("*1\r\n$3\r\nPINGGG\r\n", &command));
 }
 
 test "limits are rejected rather than trusted" {
     var command: Command = .{};
 
-    // Both are refused from the header alone, before the body arrives.
     try testing.expectError(error.TooManyArguments, decode("*9999\r\n", &command));
     try testing.expectError(error.ArgumentTooLarge, decode("*1\r\n$99999999\r\n", &command));
 }
@@ -366,8 +336,6 @@ test "errors cannot break the framing" {
         writer.buffered(),
     );
 
-    // The command name came from the client and contains a terminator. Written
-    // as is, the client would read `b'` as the start of a second reply.
     writer = .fixed(&buffer);
     try encode(&writer, .{ .error_unknown_command = "a\r\nb" });
     try testing.expectEqualStrings("-ERR unknown command 'a  b'\r\n", writer.buffered());

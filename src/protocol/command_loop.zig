@@ -6,17 +6,27 @@ const constants = @import("../constants.zig");
 const resp = @import("resp.zig");
 const Store = @import("../storage/store.zig").Store;
 
-/// Runs the whole commands sitting in a request buffer and writes their replies.
-/// A reply that will not fit stops the loop with the command unconsumed, so the
-/// caller can send what is buffered and call again: no reply is ever truncated.
 pub const CommandLoop = struct {
     command: resp.Command = .{},
 
-    /// Bytes the caller's request buffer holds. A partial command that fills it
-    /// can never complete, so it is refused rather than waited on.
     request_size_max: u32,
 
-    /// Encoded at compile time so refusing a client costs no loop and no buffer.
+    // -----------------------------------------------------------------------
+    // Types
+    // -----------------------------------------------------------------------
+
+    pub const Outcome = struct {
+        input_size_consumed: usize,
+        close: bool,
+        commit_required: bool = false,
+    };
+
+    const Stop = enum { input_exhausted, incomplete, response_full, protocol_error };
+
+    // -----------------------------------------------------------------------
+    // Canned replies
+    // -----------------------------------------------------------------------
+
     pub const reject_busy_reply = blk: {
         var buffer: [64]u8 = undefined;
         var writer: Io.Writer = .fixed(&buffer);
@@ -28,12 +38,9 @@ pub const CommandLoop = struct {
         break :blk reply;
     };
 
-    pub const Outcome = struct {
-        input_size_consumed: usize,
-        close: bool,
-    };
-
-    const Stop = enum { input_exhausted, incomplete, response_full };
+    // -----------------------------------------------------------------------
+    // Running
+    // -----------------------------------------------------------------------
 
     pub fn process(
         self: *CommandLoop,
@@ -43,6 +50,7 @@ pub const CommandLoop = struct {
     ) Outcome {
         assert(input.len <= self.request_size_max);
 
+        var close = false;
         var input_size_consumed: usize = 0;
         const stop: Stop = commands: while (input_size_consumed < input.len) {
             const input_remaining = input[input_size_consumed..];
@@ -50,7 +58,8 @@ pub const CommandLoop = struct {
                 error.Incomplete => break :commands .incomplete,
                 error.Protocol, error.TooManyArguments, error.ArgumentTooLarge => {
                     if (!encodeReply(writer, .error_protocol)) break :commands .response_full;
-                    return .{ .input_size_consumed = input_size_consumed, .close = true };
+                    close = true;
+                    break :commands .protocol_error;
                 },
             };
             assert(self.command.size > 0);
@@ -65,16 +74,16 @@ pub const CommandLoop = struct {
 
         const input_size_left = input.len - input_size_consumed;
         if (stop == .incomplete and input_size_left == self.request_size_max) {
-            if (encodeReply(writer, .error_request_too_large)) {
-                return .{ .input_size_consumed = input_size_consumed, .close = true };
-            }
+            if (encodeReply(writer, .error_request_too_large)) close = true;
         }
 
-        return .{ .input_size_consumed = input_size_consumed, .close = false };
+        return .{
+            .input_size_consumed = input_size_consumed,
+            .close = close,
+            .commit_required = store.needsCommit(),
+        };
     }
 
-    /// Leaves the writer exactly as it found it when the reply will not fit, so
-    /// the caller can send what is buffered and encode the same reply again.
     fn encodeReply(writer: *Io.Writer, reply: resp.Reply) bool {
         const end_before = writer.end;
         resp.encode(writer, reply) catch {
@@ -84,8 +93,10 @@ pub const CommandLoop = struct {
         return true;
     }
 
-    /// Returns the reply to one command, or null for an empty inline line,
-    /// which Redis also skips without a reply.
+    // -----------------------------------------------------------------------
+    // Executing
+    // -----------------------------------------------------------------------
+
     fn execute(self: *CommandLoop, store: *Store) ?resp.Reply {
         const command = &self.command;
         if (command.argument_count == 0) return null;
@@ -127,6 +138,10 @@ pub const CommandLoop = struct {
         return .{ .error_unknown_command = name };
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
