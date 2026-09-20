@@ -1,11 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const StdIo = std.Io;
+const Io = std.Io;
 const System = std.posix.system;
 
 const constants = @import("constants.zig");
-const io_module = @import("io/event.zig");
-const Io = io_module.Io;
+const EventLoop = @import("io/event_loop.zig").EventLoop;
+const RecvError = @import("io/event_loop.zig").RecvError;
+const SendError = @import("io/event_loop.zig").SendError;
 const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
 const Store = @import("storage/store.zig").Store;
 
@@ -14,7 +15,7 @@ const log = std.log.scoped(.connection);
 pub const Connection = struct {
     state: State = .free,
     fd: System.fd_t = -1,
-    io: *Io = undefined,
+    event_loop: *EventLoop = undefined,
     store: *Store = undefined,
     command_loop: CommandLoop = undefined,
 
@@ -26,8 +27,8 @@ pub const Connection = struct {
     response_size_sent: u32 = 0,
     commit_pending: bool = false,
 
-    recv_completion: Io.Completion = undefined,
-    send_completion: Io.Completion = undefined,
+    recv_completion: EventLoop.Completion = undefined,
+    send_completion: EventLoop.Completion = undefined,
     recv_in_flight: bool = false,
     send_in_flight: bool = false,
 
@@ -41,7 +42,7 @@ pub const Connection = struct {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn open(self: *Connection, io: *Io, store: *Store, fd: System.fd_t) void {
+    pub fn open(self: *Connection, event_loop: *EventLoop, store: *Store, fd: System.fd_t) void {
         assert(self.state == .free);
         assert(self.fd == -1);
         assert(!self.recv_in_flight);
@@ -50,7 +51,7 @@ pub const Connection = struct {
 
         self.state = .open;
         self.fd = fd;
-        self.io = io;
+        self.event_loop = event_loop;
         self.store = store;
         self.command_loop = .{ .request_size_max = @intCast(self.request_buffer.len) };
         self.request_size = 0;
@@ -108,7 +109,7 @@ pub const Connection = struct {
         assert(self.request_size < self.request_buffer.len);
 
         self.recv_in_flight = true;
-        self.io.recv(
+        self.event_loop.recv(
             Connection,
             self,
             onRecv,
@@ -120,8 +121,8 @@ pub const Connection = struct {
 
     fn onRecv(
         self: *Connection,
-        completion: *Io.Completion,
-        result: io_module.RecvError!usize,
+        completion: *EventLoop.Completion,
+        result: RecvError!usize,
     ) void {
         assert(completion == &self.recv_completion);
         assert(self.recv_in_flight);
@@ -150,7 +151,7 @@ pub const Connection = struct {
         assert(self.response_size_sent == 0);
 
         const request = self.request_buffer[0..self.request_size];
-        var writer: StdIo.Writer = .fixed(self.response_buffer);
+        var writer: Io.Writer = .fixed(self.response_buffer);
 
         const outcome = self.command_loop.process(self.store, request, &writer);
 
@@ -188,7 +189,7 @@ pub const Connection = struct {
         assert(!self.commit_pending);
 
         self.send_in_flight = true;
-        self.io.send(
+        self.event_loop.send(
             Connection,
             self,
             onSend,
@@ -200,8 +201,8 @@ pub const Connection = struct {
 
     fn onSend(
         self: *Connection,
-        completion: *Io.Completion,
-        result: io_module.SendError!usize,
+        completion: *EventLoop.Completion,
+        result: SendError!usize,
     ) void {
         assert(completion == &self.send_completion);
         assert(self.send_in_flight);
@@ -243,7 +244,7 @@ pub const Connection = struct {
         if (self.recv_in_flight or self.send_in_flight) return;
 
         assert(self.fd > -1);
-        self.io.close(
+        self.event_loop.close(
             Connection,
             self,
             onClose,
@@ -253,7 +254,7 @@ pub const Connection = struct {
         self.send_in_flight = true;
     }
 
-    fn onClose(self: *Connection, completion: *Io.Completion) void {
+    fn onClose(self: *Connection, completion: *EventLoop.Completion) void {
         assert(completion == &self.send_completion);
         assert(self.state == .closing);
 

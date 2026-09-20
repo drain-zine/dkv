@@ -8,7 +8,7 @@ pub const RecvError = operation.RecvError;
 pub const SendError = operation.SendError;
 pub const RunError = operation.RunError;
 
-pub const Io = switch (builtin.os.tag) {
+pub const EventLoop = switch (builtin.os.tag) {
     .macos,
     .ios,
     .tvos,
@@ -25,4 +25,4 @@ pub const Io = switch (builtin.os.tag) {
     else => @compileError("dkv has no IO backend for " ++ @tagName(builtin.os.tag)),
 };
 
-pub const Completion = Io.Completion;
+pub const Completion = EventLoop.Completion;

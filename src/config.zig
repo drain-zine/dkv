@@ -1,6 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const StdIo = std.Io;
+const Io = std.Io;
 
 const constants = @import("constants.zig");
 const Durability = @import("storage/wal.zig").Durability;
@@ -77,7 +77,7 @@ pub const Config = struct {
             if (self.address_count == constants.cluster_replica_count_max) {
                 return error.TooManyAddresses;
             }
-            _ = StdIo.net.IpAddress.parseLiteral(address) catch return error.BadAddress;
+            _ = Io.net.IpAddress.parseLiteral(address) catch return error.BadAddress;
 
             self.addresses[self.address_count] = address;
             self.address_count += 1;

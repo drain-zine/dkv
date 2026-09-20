@@ -1,12 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const StdIo = std.Io;
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const System = std.posix.system;
 
 const constants = @import("constants.zig");
-const io_module = @import("io/event.zig");
-const Io = io_module.Io;
+const EventLoop = @import("io/event_loop.zig").EventLoop;
+const AcceptError = @import("io/event_loop.zig").AcceptError;
 const Connection = @import("connection.zig").Connection;
 const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
 const Store = @import("storage/store.zig").Store;
@@ -17,25 +17,25 @@ pub const Options = struct { host: []const u8, port: u16 };
 
 pub const Server = struct {
     gpa: Allocator,
-    std_io: StdIo,
-    io: Io,
+    std_io: Io,
+    event_loop: EventLoop,
     store: *Store,
 
-    listener: StdIo.net.Server,
+    listener: Io.net.Server,
     listener_fd: System.fd_t,
 
     connections: []Connection,
     request_memory: []u8,
     response_memory: []u8,
 
-    accept_completion: Io.Completion = undefined,
+    accept_completion: EventLoop.Completion = undefined,
     accept_in_flight: bool = false,
 
     // -----------------------------------------------------------------------
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn init(gpa: Allocator, std_io: StdIo, store: *Store, options: Options) !Server {
+    pub fn init(gpa: Allocator, std_io: Io, store: *Store, options: Options) !Server {
         const connection_count = constants.connection_count_max;
         const request_buffer_size = constants.connection_request_buffer_size;
         const response_buffer_size = constants.connection_response_buffer_size;
@@ -58,19 +58,19 @@ pub const Server = struct {
             };
         }
 
-        const address = try StdIo.net.IpAddress.parse(options.host, options.port);
+        const address = try Io.net.IpAddress.parse(options.host, options.port);
         var listener = try address.listen(std_io, .{ .reuse_address = true });
         errdefer listener.deinit(std_io);
 
         const listener_fd = listener.socket.handle;
-        try Io.setNonBlocking(listener_fd);
+        try EventLoop.setNonBlocking(listener_fd);
 
-        const io = try Io.init();
+        const event_loop = try EventLoop.init();
 
         return .{
             .gpa = gpa,
             .std_io = std_io,
-            .io = io,
+            .event_loop = event_loop,
             .store = store,
             .listener = listener,
             .listener_fd = listener_fd,
@@ -106,7 +106,7 @@ pub const Server = struct {
         const timeout = constants.event_loop_wait_timeout_ms * std.time.ns_per_ms;
 
         while (true) {
-            try self.io.runForNs(timeout);
+            try self.event_loop.runForNs(timeout);
             self.commit();
         }
     }
@@ -130,7 +130,7 @@ pub const Server = struct {
 
         self.accept_in_flight = true;
         self.accept_completion.state = .unused;
-        self.io.accept(
+        self.event_loop.accept(
             Server,
             self,
             onAccept,
@@ -141,8 +141,8 @@ pub const Server = struct {
 
     fn onAccept(
         self: *Server,
-        completion: *Io.Completion,
-        result: io_module.AcceptError!System.fd_t,
+        completion: *EventLoop.Completion,
+        result: AcceptError!System.fd_t,
     ) void {
         assert(completion == &self.accept_completion);
         assert(self.accept_in_flight);
@@ -163,7 +163,7 @@ pub const Server = struct {
         };
 
         if (self.acquireConnection()) |connection| {
-            connection.open(&self.io, self.store, fd);
+            connection.open(&self.event_loop, self.store, fd);
         } else {
             log.warn("no free connection slot, refusing client", .{});
             const reply = &CommandLoop.reject_busy_reply;
@@ -205,12 +205,12 @@ const Harness = struct {
     }
 
     /// The caller owns the directory, so two servers can run over one log.
-    fn initIn(self: *Harness, dir: StdIo.Dir) !void {
+    fn initIn(self: *Harness, dir: Io.Dir) !void {
         self.tmp = null;
         try self.listen(dir);
     }
 
-    fn listen(self: *Harness, dir: StdIo.Dir) !void {
+    fn listen(self: *Harness, dir: Io.Dir) !void {
         self.store = try Store.init(testing.allocator, testing.io, .{
             .dir = dir,
             .wal = .{ .durability = .never },
@@ -225,21 +225,21 @@ const Harness = struct {
     }
 
     fn deinit(self: *Harness) void {
-        self.server.io.shutdown();
+        self.server.event_loop.shutdown();
         self.server.deinit();
         self.store.deinit();
         if (self.tmp) |*tmp| tmp.cleanup();
     }
 
     fn run(self: *Harness, pass_count: usize) void {
-        for (0..pass_count) |_| self.server.io.runForNs(pass_timeout_ns) catch unreachable;
+        for (0..pass_count) |_| self.server.event_loop.runForNs(pass_timeout_ns) catch unreachable;
     }
 
     fn connect(self: *Harness) !System.fd_t {
         const address = self.server.listener.socket.address;
         const stream = try address.connect(testing.io, .{ .mode = .stream });
 
-        try Io.setNonBlocking(stream.socket.handle);
+        try EventLoop.setNonBlocking(stream.socket.handle);
         return stream.socket.handle;
     }
 
