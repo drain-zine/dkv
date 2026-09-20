@@ -28,6 +28,7 @@ pub const Kqueue = struct {
         context: ?*anyopaque,
         callback: *const fn (kqueue: *Kqueue, completion: *Kqueue.Completion) void,
         try_operation: *const fn (completion: *Kqueue.Completion) Progress,
+        woken: bool = false,
     };
 
     pub const InitError = error{
@@ -211,6 +212,7 @@ pub const Kqueue = struct {
             assert(self.io_pending_count > 0);
 
             completion.state = .submitted;
+            completion.woken = true;
             self.submitted.push(completion);
             self.io_pending_count -= 1;
         }
@@ -316,6 +318,7 @@ pub const Kqueue = struct {
         completion.callback = callback;
         completion.try_operation = try_operation;
         completion.state = .submitted;
+        completion.woken = false;
         self.submitted.push(completion);
     }
 
@@ -326,18 +329,39 @@ pub const Kqueue = struct {
             const completion = self.submitted.pop().?;
             assert(completion.state == .submitted);
 
-            switch (completion.try_operation(completion)) {
-                .completed => {
-                    completion.state = .completed;
-                    self.completed.push(completion);
-                },
-                .io_pending => {
-                    completion.state = .io_pending;
-                    self.armCompletion(completion);
-                    self.io_pending_count += 1;
-                },
+            const woken = completion.woken;
+            completion.woken = false;
+
+            if (woken or likelyReady(completion.operation)) {
+                switch (completion.try_operation(completion)) {
+                    .completed => {
+                        completion.state = .completed;
+                        self.completed.push(completion);
+                    },
+                    .io_pending => self.markPending(completion),
+                }
+            } else {
+                self.markPending(completion);
             }
         }
+    }
+
+    /// Whether to run the syscall before registering with kqueue. A receive is
+    /// submitted just after a reply goes out, while the client is still reading
+    /// it, so the socket is empty by construction and an eager read fails 99.8%
+    /// of the time (measured). Sends hold bytes for a buffer that has room, and
+    /// accepts run against a backlog, so both almost always succeed.
+    fn likelyReady(operation: op.Operation) bool {
+        return switch (operation) {
+            .accept, .send, .close => true,
+            .recv => false,
+        };
+    }
+
+    fn markPending(self: *Kqueue, completion: *Kqueue.Completion) void {
+        completion.state = .io_pending;
+        self.armCompletion(completion);
+        self.io_pending_count += 1;
     }
 
     // -----------------------------------------------------------------------
