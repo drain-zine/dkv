@@ -6,7 +6,7 @@ const constants = @import("../constants.zig");
 const resp = @import("resp.zig");
 const Store = @import("../storage/store.zig").Store;
 
-pub const CommandLoop = struct {
+pub const Pipeline = struct {
     command: resp.Command = .{},
 
     request_size_max: u32,
@@ -43,7 +43,7 @@ pub const CommandLoop = struct {
     // -----------------------------------------------------------------------
 
     pub fn process(
-        self: *CommandLoop,
+        self: *Pipeline,
         store: *Store,
         input: []const u8,
         writer: *Io.Writer,
@@ -97,7 +97,7 @@ pub const CommandLoop = struct {
     // Executing
     // -----------------------------------------------------------------------
 
-    fn execute(self: *CommandLoop, store: *Store) ?resp.Reply {
+    fn execute(self: *Pipeline, store: *Store) ?resp.Reply {
         const command = &self.command;
         if (command.argument_count == 0) return null;
         assert(command.argument_count <= constants.resp_argument_count_max);
@@ -150,7 +150,7 @@ const request_size_max_test = 4096;
 const Harness = struct {
     tmp: testing.TmpDir,
     store: Store,
-    loop: CommandLoop,
+    pipeline: Pipeline,
 
     fn init(self: *Harness, request_size_max: u32) !void {
         self.tmp = testing.tmpDir(.{});
@@ -160,7 +160,7 @@ const Harness = struct {
             .dir = self.tmp.dir,
             .wal = .{ .durability = .never },
         });
-        self.loop = .{ .request_size_max = request_size_max };
+        self.pipeline = .{ .request_size_max = request_size_max };
     }
 
     fn deinit(self: *Harness) void {
@@ -172,12 +172,12 @@ const Harness = struct {
         self: *Harness,
         input: []const u8,
         replies_expected: []const u8,
-        outcome_expected: CommandLoop.Outcome,
+        outcome_expected: Pipeline.Outcome,
     ) !void {
         var reply_buffer: [256]u8 = undefined;
         var writer: Io.Writer = .fixed(&reply_buffer);
 
-        const outcome = self.loop.process(&self.store, input, &writer);
+        const outcome = self.pipeline.process(&self.store, input, &writer);
 
         try testing.expectEqualStrings(replies_expected, writer.buffered());
         try testing.expectEqual(outcome_expected, outcome);
@@ -333,20 +333,20 @@ test "a reply that will not fit is left for the next call" {
 
     var reply_buffer_full: ["+PONG\r\n".len]u8 = undefined;
     var writer_full: Io.Writer = .fixed(&reply_buffer_full);
-    const outcome_full = harness.loop.process(&harness.store, input, &writer_full);
+    const outcome_full = harness.pipeline.process(&harness.store, input, &writer_full);
 
     try testing.expectEqualStrings("+PONG\r\n", writer_full.buffered());
-    try testing.expectEqual(CommandLoop.Outcome{
+    try testing.expectEqual(Pipeline.Outcome{
         .input_size_consumed = ping.len,
         .close = false,
     }, outcome_full);
 
     var reply_buffer: [64]u8 = undefined;
     var writer: Io.Writer = .fixed(&reply_buffer);
-    const outcome = harness.loop.process(&harness.store, input[ping.len..], &writer);
+    const outcome = harness.pipeline.process(&harness.store, input[ping.len..], &writer);
 
     try testing.expectEqualStrings("$2\r\nhi\r\n", writer.buffered());
-    try testing.expectEqual(CommandLoop.Outcome{
+    try testing.expectEqual(Pipeline.Outcome{
         .input_size_consumed = echo.len,
         .close = false,
     }, outcome);

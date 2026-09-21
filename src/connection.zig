@@ -7,7 +7,7 @@ const constants = @import("constants.zig");
 const EventLoop = @import("io/event_loop.zig").EventLoop;
 const RecvError = @import("io/event_loop.zig").RecvError;
 const SendError = @import("io/event_loop.zig").SendError;
-const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
+const Pipeline = @import("protocol/pipeline.zig").Pipeline;
 const Store = @import("storage/store.zig").Store;
 
 const log = std.log.scoped(.connection);
@@ -17,7 +17,7 @@ pub const Connection = struct {
     fd: System.fd_t = -1,
     event_loop: *EventLoop = undefined,
     store: *Store = undefined,
-    command_loop: CommandLoop = undefined,
+    pipeline: Pipeline = undefined,
 
     request_buffer: []u8,
     request_size: u32 = 0,
@@ -53,7 +53,7 @@ pub const Connection = struct {
         self.fd = fd;
         self.event_loop = event_loop;
         self.store = store;
-        self.command_loop = .{ .request_size_max = @intCast(self.request_buffer.len) };
+        self.pipeline = .{ .request_size_max = @intCast(self.request_buffer.len) };
         self.request_size = 0;
         self.response_size = 0;
         self.response_size_sent = 0;
@@ -153,7 +153,7 @@ pub const Connection = struct {
         const request = self.request_buffer[0..self.request_size];
         var writer: Io.Writer = .fixed(self.response_buffer);
 
-        const outcome = self.command_loop.process(self.store, request, &writer);
+        const outcome = self.pipeline.process(self.store, request, &writer);
 
         self.response_size = @intCast(writer.buffered().len);
         assert(self.response_size <= self.response_buffer.len);

@@ -55,7 +55,7 @@ test {
 
     _ = @import("io/descriptor.zig");
     _ = @import("io/kqueue.zig");
-    _ = @import("protocol/command_loop.zig");
+    _ = @import("protocol/pipeline.zig");
     _ = @import("protocol/resp.zig");
     _ = @import("storage/store.zig");
     _ = @import("storage/wal.zig");

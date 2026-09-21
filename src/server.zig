@@ -8,7 +8,7 @@ const constants = @import("constants.zig");
 const EventLoop = @import("io/event_loop.zig").EventLoop;
 const AcceptError = @import("io/event_loop.zig").AcceptError;
 const Connection = @import("connection.zig").Connection;
-const CommandLoop = @import("protocol/command_loop.zig").CommandLoop;
+const Pipeline = @import("protocol/pipeline.zig").Pipeline;
 const Store = @import("storage/store.zig").Store;
 
 const log = std.log.scoped(.server);
@@ -166,7 +166,7 @@ pub const Server = struct {
             connection.open(&self.event_loop, self.store, fd);
         } else {
             log.warn("no free connection slot, refusing client", .{});
-            const reply = &CommandLoop.reject_busy_reply;
+            const reply = &Pipeline.reject_busy_reply;
             _ = System.write(fd, reply, reply.len);
             _ = System.close(fd);
         }
