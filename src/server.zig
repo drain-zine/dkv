@@ -213,7 +213,7 @@ const Harness = struct {
     fn listen(self: *Harness, dir: Io.Dir) !void {
         self.store = try Store.init(testing.allocator, testing.io, .{
             .dir = dir,
-            .wal = .{ .durability = .never },
+            .wal = .{ .durability = .buffered },
         });
         errdefer self.store.deinit();
 

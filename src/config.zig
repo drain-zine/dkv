@@ -12,6 +12,7 @@ pub const Error = error{
     BadReplica,
     BadAddress,
     BadDurability,
+    DurabilityOffInCluster,
     TooManyAddresses,
     ReplicaOutOfRange,
 };
@@ -30,7 +31,7 @@ pub const Config = struct {
         \\dkv [options]
         \\  --port=N                 client port (default 6379)
         \\  --dir=PATH               directory holding the log (default .)
-        \\  --durability=always|never
+        \\  --durability=always|buffered|off
         \\  --replica=N              this replica's index in the cluster
         \\  --addresses=A,B,C        every replica's address, in index order
         \\
@@ -49,8 +50,10 @@ pub const Config = struct {
             } else if (value(argument, "--durability=")) |text| {
                 self.durability = if (std.mem.eql(u8, text, "always"))
                     .always
-                else if (std.mem.eql(u8, text, "never"))
-                    .never
+                else if (std.mem.eql(u8, text, "buffered"))
+                    .buffered
+                else if (std.mem.eql(u8, text, "off"))
+                    .off
                 else
                     return error.BadDurability;
             } else if (value(argument, "--replica=")) |text| {
@@ -64,6 +67,8 @@ pub const Config = struct {
 
         if (self.replica) |index| {
             if (index >= self.address_count) return error.ReplicaOutOfRange;
+
+            if (self.durability == .off) return error.DurabilityOffInCluster;
         }
         return self;
     }
@@ -102,8 +107,6 @@ pub const Config = struct {
 
 const testing = std.testing;
 
-/// Builds an argv vector the way the OS hands one over, so the tests drive the
-/// same iterator `main` does rather than a stand-in.
 fn parseSlice(comptime arguments: []const [:0]const u8) Error!Config {
     const vector = comptime blk: {
         var pointers: [arguments.len][*:0]const u8 = undefined;
@@ -131,14 +134,14 @@ test "every flag together" {
         "dkv",
         "--port=7100",
         "--dir=/var/lib/dkv",
-        "--durability=never",
+        "--durability=buffered",
         "--addresses=10.0.1.1:7000,10.0.1.2:7000,10.0.1.3:7000",
         "--replica=2",
     });
 
     try testing.expectEqual(7100, config.port);
     try testing.expectEqualStrings("/var/lib/dkv", config.dir_path.?);
-    try testing.expectEqual(.never, config.durability);
+    try testing.expectEqual(.buffered, config.durability);
     try testing.expectEqual(3, config.address_count);
     try testing.expectEqualStrings("10.0.1.2:7000", config.peers()[1]);
     try testing.expectEqual(2, config.replica.?);
@@ -149,9 +152,22 @@ test "bad input is refused at startup" {
     try testing.expectError(error.BadPort, parseSlice(&.{ "dkv", "--port=99999" }));
     try testing.expectError(error.BadPort, parseSlice(&.{ "dkv", "--port=x" }));
     try testing.expectError(error.BadDurability, parseSlice(&.{ "dkv", "--durability=maybe" }));
+    try testing.expectError(error.BadDurability, parseSlice(&.{ "dkv", "--durability=never" }));
     try testing.expectError(error.MissingValue, parseSlice(&.{ "dkv", "--dir=" }));
     try testing.expectError(error.BadAddress, parseSlice(&.{ "dkv", "--addresses=nonsense" }));
     try testing.expectError(error.BadAddress, parseSlice(&.{ "dkv", "--addresses=" }));
+}
+
+test "durability off is refused for a replica" {
+    try testing.expectError(error.DurabilityOffInCluster, parseSlice(&.{
+        "dkv",
+        "--addresses=10.0.1.1:7000,10.0.1.2:7000",
+        "--replica=0",
+        "--durability=off",
+    }));
+
+    const config = try parseSlice(&.{ "dkv", "--durability=off" });
+    try testing.expectEqual(.off, config.durability);
 }
 
 test "a replica index must name one of the addresses" {

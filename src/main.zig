@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("checksum.zig");
     _ = @import("config.zig");
     _ = @import("connection.zig");
     _ = @import("constants.zig");
@@ -58,5 +59,6 @@ test {
     _ = @import("protocol/pipeline.zig");
     _ = @import("protocol/resp.zig");
     _ = @import("storage/store.zig");
+    _ = @import("vsr/message.zig");
     _ = @import("storage/wal.zig");
 }

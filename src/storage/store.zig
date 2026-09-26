@@ -20,7 +20,7 @@ pub const Store = struct {
     gpa: Allocator,
     io: Io,
     map: Map,
-    wal: wal.Wal,
+    wal: ?wal.Wal,
 
     const Map = std.StringHashMapUnmanaged([]const u8);
 
@@ -40,6 +40,10 @@ pub const Store = struct {
         var map: Map = .empty;
         errdefer deinitMap(gpa, &map);
 
+        if (options.wal.durability == .off) {
+            return .{ .gpa = gpa, .io = io, .map = map, .wal = null };
+        }
+
         var replayer: Replayer = .{ .gpa = gpa, .map = &map };
         const sink: ?wal.Sink = switch (options.startup) {
             .replay => .from(Replayer, &replayer),
@@ -54,7 +58,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
-        self.wal.close();
+        if (self.wal) |*log| log.close();
         deinitMap(self.gpa, &self.map);
     }
 
@@ -67,21 +71,26 @@ pub const Store = struct {
     }
 
     pub fn put(self: *Store, key: []const u8, value: []const u8) void {
-        _ = self.wal.append(.put, key, value) catch |err| fatal("put: log append", err);
+        if (self.wal) |*log| {
+            _ = log.append(.put, key, value) catch |err| fatal("put: log append", err);
+        }
         applyPut(self.gpa, &self.map, key, value) catch |err| fatal("put: apply", err);
     }
 
     pub fn remove(self: *Store, key: []const u8) bool {
-        _ = self.wal.append(.remove, key, "") catch |err| fatal("remove: log append", err);
+        if (self.wal) |*log| {
+            _ = log.append(.remove, key, "") catch |err| fatal("remove: log append", err);
+        }
         return applyRemove(self.gpa, &self.map, key);
     }
 
     pub fn needsCommit(self: *const Store) bool {
-        return self.wal.needsSync();
+        if (self.wal) |*log| return log.needsSync();
+        return false;
     }
 
     pub fn commit(self: *Store) void {
-        self.wal.sync() catch |err| fatal("commit", err);
+        if (self.wal) |*log| log.sync() catch |err| fatal("commit", err);
     }
 
     fn applyPut(gpa: Allocator, map: *Map, key: []const u8, value: []const u8) !void {
@@ -175,4 +184,33 @@ test "discard startup erases the log instead of hiding it" {
     try testing.expectEqual(1, store.count());
     try testing.expectEqual(null, store.get("a"));
     try testing.expectEqualStrings("3", store.get("c").?);
+}
+
+test "durability off keeps no log and nothing survives a restart" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var store = try Store.init(testing.allocator, io, .{
+            .dir = tmp.dir,
+            .wal = .{ .durability = .off },
+        });
+        defer store.deinit();
+
+        store.put("a", "1");
+        try testing.expectEqualStrings("1", store.get("a").?);
+        try testing.expect(store.remove("a"));
+        store.put("b", "2");
+
+        try testing.expectEqual(null, store.wal);
+        try testing.expect(!store.needsCommit());
+        store.commit();
+    }
+
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "dkv.wal", .{}));
+
+    var store = try Store.init(testing.allocator, io, .{ .dir = tmp.dir });
+    defer store.deinit();
+    try testing.expectEqual(0, store.count());
 }

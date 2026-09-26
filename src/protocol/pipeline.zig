@@ -158,7 +158,7 @@ const Harness = struct {
 
         self.store = try Store.init(testing.allocator, testing.io, .{
             .dir = self.tmp.dir,
-            .wal = .{ .durability = .never },
+            .wal = .{ .durability = .buffered },
         });
         self.pipeline = .{ .request_size_max = request_size_max };
     }

@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const Crc32c = std.hash.crc.Crc32Iscsi;
+const checksum = @import("../checksum.zig");
 
 const constants = @import("../constants.zig");
 const descriptor = @import("../io/descriptor.zig");
@@ -14,7 +14,7 @@ const descriptor = @import("../io/descriptor.zig");
 pub const Operation = enum(u8) { put = 1, remove = 2 };
 
 pub const Header = extern struct {
-    crc32c: u32,
+    checksum: u32,
     len: u32,
     seq: u64,
     op: u8,
@@ -90,7 +90,8 @@ pub const Sink = struct {
 
 pub const Durability = enum {
     always,
-    never,
+    buffered,
+    off,
 };
 
 pub const Options = struct {
@@ -136,10 +137,10 @@ pub const Reader = struct {
 
         const body = (try self.readBody(body_len)) orelse return null;
 
-        var hash = Crc32c.init();
+        var hash = checksum.Stream.init();
         hash.update(std.mem.asBytes(&header)[Header.prefix_size..]);
         hash.update(body);
-        if (hash.final() != header.crc32c) return null;
+        if (@as(u32, @truncate(hash.final())) != header.checksum) return null;
 
         const op = std.enums.fromInt(Operation, header.op) orelse return null;
 
@@ -199,6 +200,8 @@ pub const Wal = struct {
         options: Options,
         sink: ?Sink,
     ) !Wal {
+        assert(options.durability != .off);
+
         const file = try dir.createFile(io, path, .{
             .read = true,
             .truncate = options.discard_existing,
@@ -248,18 +251,18 @@ pub const Wal = struct {
         const seq = self.last_seq + 1;
 
         var header: Header = .{
-            .crc32c = 0,
+            .checksum = 0,
             .len = @intCast(Header.covered + key.len + value.len),
             .seq = seq,
             .op = @intFromEnum(op),
             .key_len = @intCast(key.len),
         };
 
-        var hash = Crc32c.init();
+        var hash = checksum.Stream.init();
         hash.update(std.mem.asBytes(&header)[Header.prefix_size..]);
         hash.update(key);
         hash.update(value);
-        header.crc32c = hash.final();
+        header.checksum = @truncate(hash.final());
 
         const stream = &self.writer.interface;
         try stream.writeAll(std.mem.asBytes(&header));
@@ -371,7 +374,7 @@ test "torn tail is dropped and truncated" {
 
         const stream = &wal.writer.interface;
         const header_torn: Header = .{
-            .crc32c = 0,
+            .checksum = 0,
             .len = Header.covered + 100,
             .seq = 3,
             .op = 1,

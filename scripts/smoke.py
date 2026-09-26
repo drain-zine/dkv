@@ -123,9 +123,9 @@ def main():
     finally:
         stop(server)
 
-    # The same write under --durability=never is still only in the log's
+    # The same write under --durability=buffered is still only in the log's
     # buffer, so killing the process does take it back. Proves the flag bites.
-    server = start(binary, buffered, "--durability=never")
+    server = start(binary, buffered, "--durability=buffered")
     try:
         talk(b"SET", b"transient", b"yes")
         check("write is acknowledged without a barrier",
@@ -133,12 +133,36 @@ def main():
     finally:
         stop(server, kill=True)
 
-    server = start(binary, buffered, "--durability=never")
+    server = start(binary, buffered, "--durability=buffered")
     try:
-        check("--durability=never loses it on SIGKILL",
+        check("--durability=buffered loses it on SIGKILL",
               talk(b"GET", b"transient"), b"$-1\r\n")
     finally:
         stop(server)
+
+    # --durability=off keeps no log at all, so there is nothing to replay and
+    # no file to hold it.
+    off = tempfile.mkdtemp(prefix="dkv-smoke-off-")
+    server = start(binary, off, "--durability=off")
+    try:
+        talk(b"SET", b"cached", b"yes")
+        check("off still serves reads", talk(b"GET", b"cached"), b"$3\r\nyes\r\n")
+        check("off writes no log", os.path.isfile(os.path.join(off, "dkv.wal")), False)
+    finally:
+        stop(server)
+
+    server = start(binary, off, "--durability=off")
+    try:
+        check("off has nothing to replay", talk(b"GET", b"cached"), b"$-1\r\n")
+    finally:
+        stop(server)
+
+    # A replica cannot acknowledge a prepare it never logged.
+    refused = subprocess.run(
+        [binary, "--durability=off", "--addresses=127.0.0.1:7000", "--replica=0"],
+        capture_output=True, text=True, timeout=5,
+    )
+    check("off is refused for a replica", refused.returncode != 0, True)
 
     # A bad command line must fail before anything is served.
     refused = subprocess.run([binary, "--nope=1"], capture_output=True, text=True, timeout=5)
