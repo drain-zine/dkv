@@ -4,7 +4,7 @@ const Io = std.Io;
 
 const constants = @import("../constants.zig");
 const resp = @import("resp.zig");
-const Store = @import("../storage/store.zig").Store;
+const Replica = @import("../vsr/replica.zig").Replica;
 
 pub const Pipeline = struct {
     command: resp.Command = .{},
@@ -18,7 +18,7 @@ pub const Pipeline = struct {
     pub const Outcome = struct {
         input_size_consumed: usize,
         close: bool,
-        commit_required: bool = false,
+        reply_after_op: u64 = 0,
     };
 
     const Stop = enum { input_exhausted, incomplete, response_full, protocol_error };
@@ -44,13 +44,14 @@ pub const Pipeline = struct {
 
     pub fn process(
         self: *Pipeline,
-        store: *Store,
+        replica: *Replica,
         input: []const u8,
         writer: *Io.Writer,
     ) Outcome {
         assert(input.len <= self.request_size_max);
 
         var close = false;
+        var reply_after_op: u64 = 0;
         var input_size_consumed: usize = 0;
         const stop: Stop = commands: while (input_size_consumed < input.len) {
             const input_remaining = input[input_size_consumed..];
@@ -65,7 +66,8 @@ pub const Pipeline = struct {
             assert(self.command.size > 0);
             assert(self.command.size <= input_remaining.len);
 
-            if (self.execute(store)) |reply| {
+            const command_bytes = input_remaining[0..self.command.size];
+            if (self.execute(replica, command_bytes, &reply_after_op)) |reply| {
                 if (!encodeReply(writer, reply)) break :commands .response_full;
             }
             input_size_consumed += self.command.size;
@@ -80,7 +82,7 @@ pub const Pipeline = struct {
         return .{
             .input_size_consumed = input_size_consumed,
             .close = close,
-            .commit_required = store.needsCommit(),
+            .reply_after_op = reply_after_op,
         };
     }
 
@@ -97,7 +99,12 @@ pub const Pipeline = struct {
     // Executing
     // -----------------------------------------------------------------------
 
-    fn execute(self: *Pipeline, store: *Store) ?resp.Reply {
+    fn execute(
+        self: *Pipeline,
+        replica: *Replica,
+        command_bytes: []const u8,
+        reply_after_op: *u64,
+    ) ?resp.Reply {
         const command = &self.command;
         if (command.argument_count == 0) return null;
         assert(command.argument_count <= constants.resp_argument_count_max);
@@ -118,19 +125,21 @@ pub const Pipeline = struct {
         }
         if (std.ascii.eqlIgnoreCase(name, "GET")) {
             if (arguments.len != 1) return .{ .error_arity = "get" };
-            const value = store.get(arguments[0]) orelse return .null_value;
+            const value = replica.get(arguments[0]) orelse return .null_value;
             return .{ .bulk_string = value };
         }
         if (std.ascii.eqlIgnoreCase(name, "SET")) {
             if (arguments.len != 2) return .{ .error_arity = "set" };
-            store.put(arguments[0], arguments[1]);
+            reply_after_op.* = replica.prepare(command_bytes);
+            replica.put(arguments[0], arguments[1]);
             return .ok;
         }
         if (std.ascii.eqlIgnoreCase(name, "DEL")) {
             if (arguments.len == 0) return .{ .error_arity = "del" };
+            reply_after_op.* = replica.prepare(command_bytes);
             var removed_count: u32 = 0;
             for (arguments) |key| {
-                if (store.remove(key)) removed_count += 1;
+                if (replica.remove(key)) removed_count += 1;
             }
             assert(removed_count <= arguments.len);
             return .{ .integer = removed_count };
@@ -149,22 +158,22 @@ const request_size_max_test = 4096;
 
 const Harness = struct {
     tmp: testing.TmpDir,
-    store: Store,
+    replica: Replica,
     pipeline: Pipeline,
 
     fn init(self: *Harness, request_size_max: u32) !void {
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
 
-        self.store = try Store.init(testing.allocator, testing.io, .{
+        self.replica = try Replica.init(testing.allocator, testing.io, .{
             .dir = self.tmp.dir,
-            .wal = .{ .durability = .buffered },
+            .durability = .buffered,
         });
         self.pipeline = .{ .request_size_max = request_size_max };
     }
 
     fn deinit(self: *Harness) void {
-        self.store.deinit();
+        self.replica.deinit();
         self.tmp.cleanup();
     }
 
@@ -177,7 +186,7 @@ const Harness = struct {
         var reply_buffer: [256]u8 = undefined;
         var writer: Io.Writer = .fixed(&reply_buffer);
 
-        const outcome = self.pipeline.process(&self.store, input, &writer);
+        const outcome = self.pipeline.process(&self.replica, input, &writer);
 
         try testing.expectEqualStrings(replies_expected, writer.buffered());
         try testing.expectEqual(outcome_expected, outcome);
@@ -197,6 +206,7 @@ test "pipelined commands reply in order and consume every byte" {
     try harness.expectProcess(input, "+PONG\r\n+OK\r\n$1\r\n1\r\n", .{
         .input_size_consumed = input.len,
         .close = false,
+        .reply_after_op = 1,
     });
 }
 
@@ -217,6 +227,7 @@ test "a split request replies only once it is complete" {
     try harness.expectProcess(input, "+OK\r\n", .{
         .input_size_consumed = input.len,
         .close = false,
+        .reply_after_op = 1,
     });
 }
 
@@ -259,6 +270,7 @@ test "values are binary safe" {
     try harness.expectProcess(input, "+OK\r\n$4\r\na\r\nb\r\n", .{
         .input_size_consumed = input.len,
         .close = false,
+        .reply_after_op = 1,
     });
 }
 
@@ -275,6 +287,7 @@ test "GET on a missing key is null and DEL counts removed keys" {
     try harness.expectProcess(input, "+OK\r\n:1\r\n$-1\r\n", .{
         .input_size_consumed = input.len,
         .close = false,
+        .reply_after_op = 2,
     });
 }
 
@@ -333,7 +346,7 @@ test "a reply that will not fit is left for the next call" {
 
     var reply_buffer_full: ["+PONG\r\n".len]u8 = undefined;
     var writer_full: Io.Writer = .fixed(&reply_buffer_full);
-    const outcome_full = harness.pipeline.process(&harness.store, input, &writer_full);
+    const outcome_full = harness.pipeline.process(&harness.replica, input, &writer_full);
 
     try testing.expectEqualStrings("+PONG\r\n", writer_full.buffered());
     try testing.expectEqual(Pipeline.Outcome{
@@ -343,7 +356,7 @@ test "a reply that will not fit is left for the next call" {
 
     var reply_buffer: [64]u8 = undefined;
     var writer: Io.Writer = .fixed(&reply_buffer);
-    const outcome = harness.pipeline.process(&harness.store, input[ping.len..], &writer);
+    const outcome = harness.pipeline.process(&harness.replica, input[ping.len..], &writer);
 
     try testing.expectEqualStrings("$2\r\nhi\r\n", writer.buffered());
     try testing.expectEqual(Pipeline.Outcome{

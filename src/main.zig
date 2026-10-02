@@ -3,7 +3,7 @@ const Io = std.Io;
 
 const Config = @import("config.zig").Config;
 const Server = @import("server.zig").Server;
-const Store = @import("storage/store.zig").Store;
+const Replica = @import("vsr/replica.zig").Replica;
 
 const log = std.log.scoped(.main);
 
@@ -19,14 +19,14 @@ pub fn main(init: std.process.Init) !void {
     var dir = Io.Dir.cwd();
     if (config.dir_path) |path| dir = try dir.openDir(init.io, path, .{});
 
-    var store = try Store.init(init.gpa, init.io, .{
+    var replica = try Replica.init(init.gpa, init.io, .{
         .dir = dir,
-        .startup = .replay,
-        .wal = .{ .durability = config.durability },
+        .durability = config.durability,
+        .replica = config.replica orelse 0,
     });
-    defer store.deinit();
+    defer replica.deinit();
 
-    var server = try Server.init(init.gpa, init.io, &store, .{
+    var server = try Server.init(init.gpa, init.io, &replica, .{
         .host = config.host,
         .port = config.port,
     });
@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     server.start();
 
     log.info("replayed {d} keys, listening on {s}:{d}, durability {s}", .{
-        store.count(),
+        replica.count(),
         config.host,
         config.port,
         @tagName(config.durability),
@@ -52,13 +52,14 @@ test {
     _ = @import("connection.zig");
     _ = @import("constants.zig");
     _ = @import("ring_buffer.zig");
+    _ = @import("store.zig");
     _ = @import("server.zig");
 
     _ = @import("io/descriptor.zig");
     _ = @import("io/kqueue.zig");
     _ = @import("protocol/pipeline.zig");
     _ = @import("protocol/resp.zig");
-    _ = @import("storage/store.zig");
+    _ = @import("vsr/journal.zig");
+    _ = @import("vsr/replica.zig");
     _ = @import("vsr/message.zig");
-    _ = @import("storage/wal.zig");
 }

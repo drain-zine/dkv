@@ -8,7 +8,7 @@ const EventLoop = @import("io/event_loop.zig").EventLoop;
 const RecvError = @import("io/event_loop.zig").RecvError;
 const SendError = @import("io/event_loop.zig").SendError;
 const Pipeline = @import("protocol/pipeline.zig").Pipeline;
-const Store = @import("storage/store.zig").Store;
+const Replica = @import("vsr/replica.zig").Replica;
 
 const log = std.log.scoped(.connection);
 
@@ -16,7 +16,7 @@ pub const Connection = struct {
     state: State = .free,
     fd: System.fd_t = -1,
     event_loop: *EventLoop = undefined,
-    store: *Store = undefined,
+    replica: *Replica = undefined,
     pipeline: Pipeline = undefined,
 
     request_buffer: []u8,
@@ -25,7 +25,7 @@ pub const Connection = struct {
     response_buffer: []u8,
     response_size: u32 = 0,
     response_size_sent: u32 = 0,
-    commit_pending: bool = false,
+    reply_after_op: u64 = 0,
 
     recv_completion: EventLoop.Completion = undefined,
     send_completion: EventLoop.Completion = undefined,
@@ -42,7 +42,7 @@ pub const Connection = struct {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn open(self: *Connection, event_loop: *EventLoop, store: *Store, fd: System.fd_t) void {
+    pub fn open(self: *Connection, event_loop: *EventLoop, replica: *Replica, fd: System.fd_t) void {
         assert(self.state == .free);
         assert(self.fd == -1);
         assert(!self.recv_in_flight);
@@ -52,12 +52,12 @@ pub const Connection = struct {
         self.state = .open;
         self.fd = fd;
         self.event_loop = event_loop;
-        self.store = store;
+        self.replica = replica;
         self.pipeline = .{ .request_size_max = @intCast(self.request_buffer.len) };
         self.request_size = 0;
         self.response_size = 0;
         self.response_size_sent = 0;
-        self.commit_pending = false;
+        self.reply_after_op = 0;
         self.recv_completion.state = .unused;
         self.send_completion.state = .unused;
 
@@ -80,7 +80,7 @@ pub const Connection = struct {
             self.processRequest();
         }
 
-        if (self.hasPendingResponse() and !self.send_in_flight and !self.commit_pending) {
+        if (self.hasPendingResponse() and !self.send_in_flight and !self.waitingOnCommit()) {
             self.submitSend();
         }
 
@@ -94,8 +94,14 @@ pub const Connection = struct {
         }
     }
 
+    pub fn waitingOnCommit(self: *const Connection) bool {
+        return self.reply_after_op > self.replica.commit_number;
+    }
+
     pub fn releaseResponse(self: *Connection) void {
-        self.commit_pending = false;
+        assert(!self.waitingOnCommit());
+
+        self.reply_after_op = 0;
         self.advance();
     }
 
@@ -153,7 +159,7 @@ pub const Connection = struct {
         const request = self.request_buffer[0..self.request_size];
         var writer: Io.Writer = .fixed(self.response_buffer);
 
-        const outcome = self.pipeline.process(self.store, request, &writer);
+        const outcome = self.pipeline.process(self.replica, request, &writer);
 
         self.response_size = @intCast(writer.buffered().len);
         assert(self.response_size <= self.response_buffer.len);
@@ -169,7 +175,7 @@ pub const Connection = struct {
         );
         self.request_size = remaining;
 
-        self.commit_pending = outcome.commit_required;
+        self.reply_after_op = outcome.reply_after_op;
         if (outcome.close) self.state = .closing;
     }
 
@@ -186,7 +192,7 @@ pub const Connection = struct {
         assert(self.state != .free);
         assert(!self.send_in_flight);
         assert(self.hasPendingResponse());
-        assert(!self.commit_pending);
+        assert(!self.waitingOnCommit());
 
         self.send_in_flight = true;
         self.event_loop.send(
@@ -264,6 +270,6 @@ pub const Connection = struct {
         self.request_size = 0;
         self.response_size = 0;
         self.response_size_sent = 0;
-        self.commit_pending = false;
+        self.reply_after_op = 0;
     }
 };

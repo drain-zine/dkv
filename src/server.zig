@@ -9,7 +9,7 @@ const EventLoop = @import("io/event_loop.zig").EventLoop;
 const AcceptError = @import("io/event_loop.zig").AcceptError;
 const Connection = @import("connection.zig").Connection;
 const Pipeline = @import("protocol/pipeline.zig").Pipeline;
-const Store = @import("storage/store.zig").Store;
+const Replica = @import("vsr/replica.zig").Replica;
 
 const log = std.log.scoped(.server);
 
@@ -19,7 +19,7 @@ pub const Server = struct {
     gpa: Allocator,
     std_io: Io,
     event_loop: EventLoop,
-    store: *Store,
+    replica: *Replica,
 
     listener: Io.net.Server,
     listener_fd: System.fd_t,
@@ -35,7 +35,7 @@ pub const Server = struct {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    pub fn init(gpa: Allocator, std_io: Io, store: *Store, options: Options) !Server {
+    pub fn init(gpa: Allocator, std_io: Io, replica: *Replica, options: Options) !Server {
         const connection_count = constants.connection_count_max;
         const request_buffer_size = constants.connection_request_buffer_size;
         const response_buffer_size = constants.connection_response_buffer_size;
@@ -71,7 +71,7 @@ pub const Server = struct {
             .gpa = gpa,
             .std_io = std_io,
             .event_loop = event_loop,
-            .store = store,
+            .replica = replica,
             .listener = listener,
             .listener_fd = listener_fd,
             .connections = connections,
@@ -112,12 +112,14 @@ pub const Server = struct {
     }
 
     fn commit(self: *Server) void {
-        if (!self.store.needsCommit()) return;
+        if (!self.replica.needsCommit()) return;
 
-        self.store.commit();
+        self.replica.commit();
 
         for (self.connections) |*connection| {
-            if (connection.commit_pending) connection.releaseResponse();
+            if (connection.reply_after_op > 0 and !connection.waitingOnCommit()) {
+                connection.releaseResponse();
+            }
         }
     }
 
@@ -163,7 +165,7 @@ pub const Server = struct {
         };
 
         if (self.acquireConnection()) |connection| {
-            connection.open(&self.event_loop, self.store, fd);
+            connection.open(&self.event_loop, self.replica, fd);
         } else {
             log.warn("no free connection slot, refusing client", .{});
             const reply = &Pipeline.reject_busy_reply;
@@ -191,7 +193,7 @@ const testing = std.testing;
 
 const Harness = struct {
     tmp: ?testing.TmpDir,
-    store: Store,
+    replica: Replica,
     server: Server,
 
     const pass_timeout_ns = 1 * std.time.ns_per_ms;
@@ -211,13 +213,13 @@ const Harness = struct {
     }
 
     fn listen(self: *Harness, dir: Io.Dir) !void {
-        self.store = try Store.init(testing.allocator, testing.io, .{
+        self.replica = try Replica.init(testing.allocator, testing.io, .{
             .dir = dir,
-            .wal = .{ .durability = .buffered },
+            .durability = .buffered,
         });
-        errdefer self.store.deinit();
+        errdefer self.replica.deinit();
 
-        self.server = try Server.init(testing.allocator, testing.io, &self.store, .{
+        self.server = try Server.init(testing.allocator, testing.io, &self.replica, .{
             .host = "127.0.0.1",
             .port = 0,
         });
@@ -227,7 +229,7 @@ const Harness = struct {
     fn deinit(self: *Harness) void {
         self.server.event_loop.shutdown();
         self.server.deinit();
-        self.store.deinit();
+        self.replica.deinit();
         if (self.tmp) |*tmp| tmp.cleanup();
     }
 

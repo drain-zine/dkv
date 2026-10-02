@@ -3,7 +3,7 @@ const assert = std.debug.assert;
 const Io = std.Io;
 
 const constants = @import("constants.zig");
-const Durability = @import("storage/wal.zig").Durability;
+const Durability = @import("vsr/journal.zig").Durability;
 
 pub const Error = error{
     UnknownFlag,

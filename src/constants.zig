@@ -59,6 +59,20 @@ comptime {
 /// held in a fixed array, so this bounds `--addresses`.
 pub const cluster_replica_count_max = 7;
 
+pub const cluster_message_header_size = 96;
+
+pub const cluster_message_body_size_max = resp_command_size_max;
+
+pub const cluster_message_size_max = cluster_message_header_size + cluster_message_body_size_max;
+
+pub const journal_op_count_max = 1024 * 1024;
+
+pub const journal_buffer_size = 64 * 1024;
+
+comptime {
+    assert(journal_op_count_max > 0);
+}
+
 // ---------------------------------------------------------------------------
 // Event loop
 // ---------------------------------------------------------------------------
@@ -96,18 +110,6 @@ comptime {
     // kqueue queues one change per pending operation, epoll one per descriptor.
     assert(io_change_count_max >= io_in_flight_max);
     assert(io_change_count_max >= io_descriptor_count_max);
-}
-
-// ---------------------------------------------------------------------------
-// Write-ahead log
-// ---------------------------------------------------------------------------
-
-pub const wal_buffer_size = 64 * 1024;
-
-pub const wal_record_size_max = 16 * 1024 * 1024;
-
-comptime {
-    assert(resp_command_size_max <= wal_record_size_max);
 }
 
 fn digitCount(comptime value: u64) usize {
