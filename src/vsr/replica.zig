@@ -4,9 +4,9 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
 const constants = @import("../constants.zig");
-const resp = @import("../protocol/resp.zig");
 const journal = @import("journal.zig");
 const message = @import("message.zig");
+const Pipeline = @import("../protocol/pipeline.zig").Pipeline;
 const Store = @import("../store.zig").Store;
 
 const Header = message.Header;
@@ -29,13 +29,18 @@ pub const Replica = struct {
 
     cluster: u32,
     replica: u8,
+    durability: journal.Durability,
     view: u32,
-    op: u64,
     commit_number: u64,
 
     journal: ?Journal,
     store: Store,
     message_buffer: []align(@alignOf(Header)) u8,
+
+    /// Set while the log is being replayed through the pipeline: a record that
+    /// is already in the journal must not be appended again.
+    replaying: bool,
+    pending_replay: bool,
 
     // -----------------------------------------------------------------------
     // Lifecycle
@@ -59,12 +64,14 @@ pub const Replica = struct {
             .io = io,
             .cluster = options.cluster,
             .replica = options.replica,
+            .durability = options.durability,
             .view = 0,
-            .op = 0,
             .commit_number = 0,
             .journal = null,
             .store = store,
             .message_buffer = message_buffer,
+            .replaying = false,
+            .pending_replay = false,
         };
 
         if (options.durability != .off) {
@@ -73,7 +80,10 @@ pub const Replica = struct {
                 .durability = options.durability,
                 .discard_existing = options.discard_existing,
             });
-            try self.replay();
+            const recovered = self.journal.?.recovered();
+            self.commit_number = recovered.op;
+            self.view = recovered.view;
+            self.pending_replay = recovered.op > 0;
         }
 
         return self;
@@ -85,36 +95,57 @@ pub const Replica = struct {
         self.gpa.free(self.message_buffer);
     }
 
-    /// Every durable prepare is committed at cluster size one, so recovery is
-    /// just applying the whole log in order.
-    fn replay(self: *Replica) !void {
-        const log_file = &self.journal.?;
-        const recovered = log_file.recovered();
+    /// Feeds every logged prepare back through the pipeline, so one dispatcher
+    /// defines what a command means for a client and for a restart.
+    pub fn replay(self: *Replica) !void {
+        const log_file = &(self.journal orelse return);
 
-        var op: u64 = 1;
-        while (op <= recovered.op) : (op += 1) {
-            const record = try log_file.read(op, self.message_buffer);
-            self.apply(record.body());
+        self.replaying = true;
+        defer self.replaying = false;
+
+        var pipeline: Pipeline = .{ .request_size_max = constants.resp_command_size_max };
+
+        var op_next: u64 = 1;
+        while (op_next <= log_file.op) : (op_next += 1) {
+            const record = try log_file.read(op_next, self.message_buffer);
+            const body = record.body();
+
+            var reply_buffer: [64]u8 = undefined;
+            var writer: Io.Writer = .fixed(&reply_buffer);
+
+            const outcome = pipeline.process(Replica, self, body, &writer);
+            assert(outcome.input_size_consumed == body.len);
+            assert(!outcome.close);
         }
 
-        self.op = recovered.op;
-        self.commit_number = recovered.op;
-        self.view = recovered.view;
+        self.pending_replay = false;
     }
 
     // -----------------------------------------------------------------------
     // Replicating
     // -----------------------------------------------------------------------
 
+    /// The highest op this replica holds. The journal owns it whenever there is
+    /// one; with `off` every prepare commits at once, so the commit number is
+    /// the only counter.
+    pub fn op(self: *const Replica) u64 {
+        if (self.journal) |*log_file| return log_file.op;
+        return self.commit_number;
+    }
+
     pub fn prepare(self: *Replica, body: []const u8) u64 {
         assert(body.len > 0);
         assert(body.len <= constants.cluster_message_body_size_max);
-        assert(self.commit_number <= self.op);
+        assert(self.commit_number <= self.op());
+        assert(self.replaying or !self.pending_replay);
+
+        if (self.replaying) return self.op();
 
         const log_file = &(self.journal orelse {
-            self.op += 1;
-            self.commit_number = self.op;
-            return self.op;
+            assert(self.durability == .off);
+
+            self.commit_number += 1;
+            return self.commit_number;
         });
 
         var header: Header = std.mem.zeroes(Header);
@@ -122,20 +153,18 @@ pub const Replica = struct {
         header.replica = self.replica;
         header.command = @intFromEnum(message.Command.prepare);
         header.view = self.view;
-        header.op = self.op + 1;
+        header.op = log_file.op + 1;
         header.commit = self.commit_number;
         header.parent = log_file.checksum;
         header.size = @sizeOf(Header) + @as(u32, @intCast(body.len));
         header.setChecksums(body);
 
         log_file.append(&header, body) catch |err| fatal("prepare", err);
+        assert(log_file.op == header.op);
 
-        self.op = header.op;
-        assert(self.op == log_file.op);
+        if (self.durability != .always) self.commit_number = header.op;
 
-        if (log_file.durability != .always) self.commit_number = self.op;
-
-        return self.op;
+        return header.op;
     }
 
     pub fn needsCommit(self: *const Replica) bool {
@@ -148,7 +177,7 @@ pub const Replica = struct {
 
         log_file.sync() catch |err| fatal("commit", err);
 
-        assert(log_file.op_durable <= self.op);
+        assert(log_file.op_durable <= log_file.op);
         self.commit_number = log_file.op_durable;
     }
 
@@ -172,29 +201,6 @@ pub const Replica = struct {
         return self.store.count();
     }
 
-    fn apply(self: *Replica, body: []const u8) void {
-        var command: resp.Command = .{};
-        resp.decode(body, &command) catch |err| fatal("replay: decode", err);
-        assert(command.size == body.len);
-        assert(command.argument_count > 0);
-
-        const name = command.name();
-        const arguments = command.arguments[1..command.argument_count];
-
-        if (std.ascii.eqlIgnoreCase(name, "SET")) {
-            assert(arguments.len == 2);
-            self.store.put(arguments[0], arguments[1]);
-            return;
-        }
-        if (std.ascii.eqlIgnoreCase(name, "DEL")) {
-            assert(arguments.len > 0);
-            for (arguments) |key| _ = self.store.remove(key);
-            return;
-        }
-
-        std.debug.panic("replay: {s} is not a write", .{name});
-    }
-
     fn fatal(operation: []const u8, err: anyerror) noreturn {
         std.debug.panic("replica {s} failed: {s}", .{ operation, @errorName(err) });
     }
@@ -210,7 +216,7 @@ const set_a = "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
 const set_b = "*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n";
 const del_a = "*2\r\n$3\r\nDEL\r\n$1\r\na\r\n";
 
-test "a committed write survives a restart" {
+test "a committed write is recovered as an op, awaiting replay" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -231,35 +237,10 @@ test "a committed write survives a restart" {
     var replica = try Replica.init(testing.allocator, testing.io, .{ .dir = tmp.dir });
     defer replica.deinit();
 
-    try testing.expectEqual(1, replica.op);
+    try testing.expectEqual(1, replica.op());
     try testing.expectEqual(1, replica.commit_number);
-    try testing.expectEqualStrings("1", replica.get("a").?);
-}
-
-test "replay rebuilds the keyspace in log order" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    {
-        var replica = try Replica.init(testing.allocator, testing.io, .{ .dir = tmp.dir });
-        defer replica.deinit();
-
-        _ = replica.prepare(set_a);
-        replica.put("a", "1");
-        _ = replica.prepare(set_b);
-        replica.put("b", "2");
-        _ = replica.prepare(del_a);
-        _ = replica.remove("a");
-        replica.commit();
-    }
-
-    var replica = try Replica.init(testing.allocator, testing.io, .{ .dir = tmp.dir });
-    defer replica.deinit();
-
-    try testing.expectEqual(3, replica.op);
-    try testing.expectEqual(1, replica.count());
-    try testing.expectEqual(null, replica.get("a"));
-    try testing.expectEqualStrings("2", replica.get("b").?);
+    try testing.expect(replica.pending_replay);
+    try testing.expectEqual(0, replica.count());
 }
 
 test "buffered commits without a barrier, off keeps no journal" {
@@ -289,4 +270,36 @@ test "buffered commits without a barrier, off keeps no journal" {
     try testing.expectEqual(1, replica.prepare(set_a));
     try testing.expectEqual(1, replica.commit_number);
     try testing.expect(!replica.needsCommit());
+}
+
+test "replay rebuilds the keyspace through the same dispatcher" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var replica = try Replica.init(testing.allocator, testing.io, .{ .dir = tmp.dir });
+        defer replica.deinit();
+
+        _ = replica.prepare(set_a);
+        replica.put("a", "1");
+        _ = replica.prepare(set_b);
+        replica.put("b", "2");
+        _ = replica.prepare(del_a);
+        _ = replica.remove("a");
+        replica.commit();
+    }
+
+    var replica = try Replica.init(testing.allocator, testing.io, .{ .dir = tmp.dir });
+    defer replica.deinit();
+
+    try testing.expectEqual(3, replica.op());
+    try testing.expect(replica.pending_replay);
+    try testing.expectEqual(0, replica.count());
+
+    try replica.replay();
+
+    try testing.expect(!replica.pending_replay);
+    try testing.expectEqual(1, replica.count());
+    try testing.expectEqual(null, replica.get("a"));
+    try testing.expectEqualStrings("2", replica.get("b").?);
 }

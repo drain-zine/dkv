@@ -218,6 +218,7 @@ const Harness = struct {
             .durability = .buffered,
         });
         errdefer self.replica.deinit();
+        try self.replica.replay();
 
         self.server = try Server.init(testing.allocator, testing.io, &self.replica, .{
             .host = "127.0.0.1",

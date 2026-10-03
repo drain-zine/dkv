@@ -159,7 +159,7 @@ pub const Connection = struct {
         const request = self.request_buffer[0..self.request_size];
         var writer: Io.Writer = .fixed(self.response_buffer);
 
-        const outcome = self.pipeline.process(self.replica, request, &writer);
+        const outcome = self.pipeline.process(Replica, self.replica, request, &writer);
 
         self.response_size = @intCast(writer.buffered().len);
         assert(self.response_size <= self.response_buffer.len);

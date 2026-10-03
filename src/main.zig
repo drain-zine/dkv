@@ -21,10 +21,13 @@ pub fn main(init: std.process.Init) !void {
 
     var replica = try Replica.init(init.gpa, init.io, .{
         .dir = dir,
+        .cluster = config.cluster,
         .durability = config.durability,
         .replica = config.replica orelse 0,
     });
     defer replica.deinit();
+
+    try replica.replay();
 
     var server = try Server.init(init.gpa, init.io, &replica, .{
         .host = config.host,

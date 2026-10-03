@@ -42,7 +42,6 @@ pub const Journal = struct {
     view: u32,
 
     offsets: []u64,
-    size: u64,
 
     // -----------------------------------------------------------------------
     // Lifecycle
@@ -95,7 +94,6 @@ pub const Journal = struct {
             .checksum = scanner.checksum,
             .view = scanner.view,
             .offsets = offsets,
-            .size = scanner.valid_end,
         };
         try journal.writer.seekTo(scanner.valid_end);
         return journal;
@@ -127,12 +125,13 @@ pub const Journal = struct {
 
         if (header.op - 1 >= self.offsets.len) return error.JournalFull;
 
+        const offset = self.writer.logicalPos();
+
         const stream = &self.writer.interface;
         try stream.writeAll(std.mem.asBytes(header));
         try stream.writeAll(body);
 
-        self.offsets[header.op - 1] = self.size;
-        self.size += header.size;
+        self.offsets[header.op - 1] = offset;
         self.op = header.op;
         self.checksum = header.checksum;
         self.view = header.view;
@@ -201,7 +200,6 @@ pub const Journal = struct {
         try self.file.setLength(self.io, end);
         try self.writer.seekTo(end);
 
-        self.size = end;
         self.op = op;
         self.op_durable = @min(self.op_durable, op);
         self.checksum = if (op == 0) 0 else (try self.headerAt(self.offsets[op - 1])).checksum;
@@ -257,7 +255,10 @@ const Scanner = struct {
                 else => return err,
             };
 
-            if (header.valid(self.cluster) != null) return;
+            if (header.valid(self.cluster)) |reason| {
+                if (reason == Header.ValidationError.InvalidCluster) return error.ClusterMismatch;
+                return;
+            }
             if (header.op != self.op + 1) return;
             if (header.parent != self.checksum) return;
             if (header.view < self.view) return;
@@ -480,4 +481,29 @@ test "buffered never asks for a barrier" {
 
     _ = try appendPrepare(&log, body_a);
     try testing.expect(!log.needsSync());
+}
+
+test "a journal from another cluster is refused, not truncated" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var log = try Journal.open(testing.allocator, testing.io, tmp.dir, "test.journal", options_test);
+        defer log.close();
+
+        _ = try appendPrepare(&log, body_a);
+        try log.sync();
+    }
+
+    try testing.expectError(error.ClusterMismatch, Journal.open(
+        testing.allocator,
+        testing.io,
+        tmp.dir,
+        "test.journal",
+        .{ .cluster = cluster_test + 1 },
+    ));
+
+    var log = try Journal.open(testing.allocator, testing.io, tmp.dir, "test.journal", options_test);
+    defer log.close();
+    try testing.expectEqual(1, log.recovered().op);
 }

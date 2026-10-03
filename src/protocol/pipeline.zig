@@ -4,7 +4,6 @@ const Io = std.Io;
 
 const constants = @import("../constants.zig");
 const resp = @import("resp.zig");
-const Replica = @import("../vsr/replica.zig").Replica;
 
 pub const Pipeline = struct {
     command: resp.Command = .{},
@@ -19,6 +18,53 @@ pub const Pipeline = struct {
         input_size_consumed: usize,
         close: bool,
         reply_after_op: u64 = 0,
+    };
+
+    const Executed = struct {
+        reply: ?resp.Reply,
+        op: u64 = 0,
+    };
+
+    const Verb = enum {
+        ping,
+        echo,
+        get,
+        set,
+        del,
+
+        fn parse(name: []const u8) ?Verb {
+            if (std.ascii.eqlIgnoreCase(name, "PING")) return .ping;
+            if (std.ascii.eqlIgnoreCase(name, "ECHO")) return .echo;
+            if (std.ascii.eqlIgnoreCase(name, "GET")) return .get;
+            if (std.ascii.eqlIgnoreCase(name, "SET")) return .set;
+            if (std.ascii.eqlIgnoreCase(name, "DEL")) return .del;
+            return null;
+        }
+
+        fn write(verb: Verb) bool {
+            return switch (verb) {
+                .set, .del => true,
+                .ping, .echo, .get => false,
+            };
+        }
+
+        fn arityError(verb: Verb, argument_count: usize) ?resp.Reply {
+            const ok = switch (verb) {
+                .ping => argument_count <= 1,
+                .echo, .get => argument_count == 1,
+                .set => argument_count == 2,
+                .del => argument_count >= 1,
+            };
+            if (ok) return null;
+
+            return .{ .error_arity = switch (verb) {
+                .ping => "ping",
+                .echo => "echo",
+                .get => "get",
+                .set => "set",
+                .del => "del",
+            } };
+        }
     };
 
     const Stop = enum { input_exhausted, incomplete, response_full, protocol_error };
@@ -44,7 +90,8 @@ pub const Pipeline = struct {
 
     pub fn process(
         self: *Pipeline,
-        replica: *Replica,
+        comptime Context: type,
+        context: *Context,
         input: []const u8,
         writer: *Io.Writer,
     ) Outcome {
@@ -67,9 +114,11 @@ pub const Pipeline = struct {
             assert(self.command.size <= input_remaining.len);
 
             const command_bytes = input_remaining[0..self.command.size];
-            if (self.execute(replica, command_bytes, &reply_after_op)) |reply| {
+            const executed = self.execute(Context, context, command_bytes);
+            if (executed.reply) |reply| {
                 if (!encodeReply(writer, reply)) break :commands .response_full;
             }
+            if (executed.op > reply_after_op) reply_after_op = executed.op;
             input_size_consumed += self.command.size;
         } else .input_exhausted;
         assert(input_size_consumed <= input.len);
@@ -101,50 +150,44 @@ pub const Pipeline = struct {
 
     fn execute(
         self: *Pipeline,
-        replica: *Replica,
+        comptime Context: type,
+        context: *Context,
         command_bytes: []const u8,
-        reply_after_op: *u64,
-    ) ?resp.Reply {
+    ) Executed {
         const command = &self.command;
-        if (command.argument_count == 0) return null;
+        if (command.argument_count == 0) return .{ .reply = null };
         assert(command.argument_count <= constants.resp_argument_count_max);
 
         const name = command.name();
         const arguments = command.arguments[1..command.argument_count];
 
-        if (std.ascii.eqlIgnoreCase(name, "PING")) {
-            return switch (arguments.len) {
-                0 => .pong,
-                1 => .{ .bulk_string = arguments[0] },
-                else => .{ .error_arity = "ping" },
-            };
-        }
-        if (std.ascii.eqlIgnoreCase(name, "ECHO")) {
-            if (arguments.len != 1) return .{ .error_arity = "echo" };
-            return .{ .bulk_string = arguments[0] };
-        }
-        if (std.ascii.eqlIgnoreCase(name, "GET")) {
-            if (arguments.len != 1) return .{ .error_arity = "get" };
-            const value = replica.get(arguments[0]) orelse return .null_value;
-            return .{ .bulk_string = value };
-        }
-        if (std.ascii.eqlIgnoreCase(name, "SET")) {
-            if (arguments.len != 2) return .{ .error_arity = "set" };
-            reply_after_op.* = replica.prepare(command_bytes);
-            replica.put(arguments[0], arguments[1]);
-            return .ok;
-        }
-        if (std.ascii.eqlIgnoreCase(name, "DEL")) {
-            if (arguments.len == 0) return .{ .error_arity = "del" };
-            reply_after_op.* = replica.prepare(command_bytes);
-            var removed_count: u32 = 0;
-            for (arguments) |key| {
-                if (replica.remove(key)) removed_count += 1;
-            }
-            assert(removed_count <= arguments.len);
-            return .{ .integer = removed_count };
-        }
-        return .{ .error_unknown_command = name };
+        const verb = Verb.parse(name) orelse {
+            return .{ .reply = .{ .error_unknown_command = name } };
+        };
+        if (Verb.arityError(verb, arguments.len)) |reply| return .{ .reply = reply };
+
+        const op = if (verb.write()) context.prepare(command_bytes) else 0;
+
+        return .{ .op = op, .reply = switch (verb) {
+            .ping => if (arguments.len == 0) .pong else .{ .bulk_string = arguments[0] },
+            .echo => .{ .bulk_string = arguments[0] },
+            .get => if (context.get(arguments[0])) |value|
+                resp.Reply{ .bulk_string = value }
+            else
+                resp.Reply.null_value,
+            .set => set: {
+                context.put(arguments[0], arguments[1]);
+                break :set resp.Reply.ok;
+            },
+            .del => del: {
+                var removed_count: u32 = 0;
+                for (arguments) |key| {
+                    if (context.remove(key)) removed_count += 1;
+                }
+                assert(removed_count <= arguments.len);
+                break :del resp.Reply{ .integer = removed_count };
+            },
+        } };
     }
 };
 
@@ -156,25 +199,43 @@ const testing = std.testing;
 
 const request_size_max_test = 4096;
 
+const Store = @import("../store.zig").Store;
+
+const Fake = struct {
+    store: Store,
+    op: u64 = 0,
+
+    fn prepare(self: *Fake, body: []const u8) u64 {
+        assert(body.len > 0);
+
+        self.op += 1;
+        return self.op;
+    }
+
+    fn get(self: *const Fake, key: []const u8) ?[]const u8 {
+        return self.store.get(key);
+    }
+
+    fn put(self: *Fake, key: []const u8, value: []const u8) void {
+        self.store.put(key, value);
+    }
+
+    fn remove(self: *Fake, key: []const u8) bool {
+        return self.store.remove(key);
+    }
+};
+
 const Harness = struct {
-    tmp: testing.TmpDir,
-    replica: Replica,
+    context: Fake,
     pipeline: Pipeline,
 
     fn init(self: *Harness, request_size_max: u32) !void {
-        self.tmp = testing.tmpDir(.{});
-        errdefer self.tmp.cleanup();
-
-        self.replica = try Replica.init(testing.allocator, testing.io, .{
-            .dir = self.tmp.dir,
-            .durability = .buffered,
-        });
+        self.context = .{ .store = try Store.init(testing.allocator) };
         self.pipeline = .{ .request_size_max = request_size_max };
     }
 
     fn deinit(self: *Harness) void {
-        self.replica.deinit();
-        self.tmp.cleanup();
+        self.context.store.deinit();
     }
 
     fn expectProcess(
@@ -186,7 +247,7 @@ const Harness = struct {
         var reply_buffer: [256]u8 = undefined;
         var writer: Io.Writer = .fixed(&reply_buffer);
 
-        const outcome = self.pipeline.process(&self.replica, input, &writer);
+        const outcome = self.pipeline.process(Fake, &self.context, input, &writer);
 
         try testing.expectEqualStrings(replies_expected, writer.buffered());
         try testing.expectEqual(outcome_expected, outcome);
@@ -346,7 +407,7 @@ test "a reply that will not fit is left for the next call" {
 
     var reply_buffer_full: ["+PONG\r\n".len]u8 = undefined;
     var writer_full: Io.Writer = .fixed(&reply_buffer_full);
-    const outcome_full = harness.pipeline.process(&harness.replica, input, &writer_full);
+    const outcome_full = harness.pipeline.process(Fake, &harness.context, input, &writer_full);
 
     try testing.expectEqualStrings("+PONG\r\n", writer_full.buffered());
     try testing.expectEqual(Pipeline.Outcome{
@@ -356,7 +417,7 @@ test "a reply that will not fit is left for the next call" {
 
     var reply_buffer: [64]u8 = undefined;
     var writer: Io.Writer = .fixed(&reply_buffer);
-    const outcome = harness.pipeline.process(&harness.replica, input[ping.len..], &writer);
+    const outcome = harness.pipeline.process(Fake, &harness.context, input[ping.len..], &writer);
 
     try testing.expectEqualStrings("$2\r\nhi\r\n", writer.buffered());
     try testing.expectEqual(Pipeline.Outcome{

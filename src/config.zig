@@ -12,6 +12,8 @@ pub const Error = error{
     BadReplica,
     BadAddress,
     BadDurability,
+    BadCluster,
+    ClusterRequired,
     DurabilityOffInCluster,
     TooManyAddresses,
     ReplicaOutOfRange,
@@ -23,6 +25,7 @@ pub const Config = struct {
     dir_path: ?[]const u8 = null,
     durability: Durability = .always,
 
+    cluster: u32 = 0,
     replica: ?u8 = null,
     addresses: [constants.cluster_replica_count_max][]const u8 = undefined,
     address_count: u8 = 0,
@@ -32,6 +35,7 @@ pub const Config = struct {
         \\  --port=N                 client port (default 6379)
         \\  --dir=PATH               directory holding the log (default .)
         \\  --durability=always|buffered|off
+        \\  --cluster=N              this cluster's id, the same on every replica
         \\  --replica=N              this replica's index in the cluster
         \\  --addresses=A,B,C        every replica's address, in index order
         \\
@@ -39,6 +43,7 @@ pub const Config = struct {
 
     pub fn parse(arguments: *std.process.Args.Iterator) Error!Config {
         var self: Config = .{};
+        var cluster_given = false;
         _ = arguments.skip();
 
         while (arguments.next()) |argument| {
@@ -56,6 +61,9 @@ pub const Config = struct {
                     .off
                 else
                     return error.BadDurability;
+            } else if (value(argument, "--cluster=")) |text| {
+                self.cluster = std.fmt.parseInt(u32, text, 10) catch return error.BadCluster;
+                cluster_given = true;
             } else if (value(argument, "--replica=")) |text| {
                 self.replica = std.fmt.parseInt(u8, text, 10) catch return error.BadReplica;
             } else if (value(argument, "--addresses=")) |text| {
@@ -64,6 +72,8 @@ pub const Config = struct {
                 return error.UnknownFlag;
             }
         }
+
+        if (self.address_count > 0 and !cluster_given) return error.ClusterRequired;
 
         if (self.replica) |index| {
             if (index >= self.address_count) return error.ReplicaOutOfRange;
@@ -127,6 +137,7 @@ test "defaults when nothing is passed" {
     try testing.expectEqual(null, config.dir_path);
     try testing.expectEqual(null, config.replica);
     try testing.expectEqual(0, config.address_count);
+    try testing.expectEqual(0, config.cluster);
 }
 
 test "every flag together" {
@@ -137,6 +148,7 @@ test "every flag together" {
         "--durability=buffered",
         "--addresses=10.0.1.1:7000,10.0.1.2:7000,10.0.1.3:7000",
         "--replica=2",
+        "--cluster=9",
     });
 
     try testing.expectEqual(7100, config.port);
@@ -145,6 +157,7 @@ test "every flag together" {
     try testing.expectEqual(3, config.address_count);
     try testing.expectEqualStrings("10.0.1.2:7000", config.peers()[1]);
     try testing.expectEqual(2, config.replica.?);
+    try testing.expectEqual(9, config.cluster);
 }
 
 test "bad input is refused at startup" {
@@ -156,6 +169,24 @@ test "bad input is refused at startup" {
     try testing.expectError(error.MissingValue, parseSlice(&.{ "dkv", "--dir=" }));
     try testing.expectError(error.BadAddress, parseSlice(&.{ "dkv", "--addresses=nonsense" }));
     try testing.expectError(error.BadAddress, parseSlice(&.{ "dkv", "--addresses=" }));
+    try testing.expectError(error.BadCluster, parseSlice(&.{ "dkv", "--cluster=x" }));
+    try testing.expectError(error.BadCluster, parseSlice(&.{ "dkv", "--cluster=-1" }));
+}
+
+test "a cluster of more than one needs its id spelled out" {
+    try testing.expectError(error.ClusterRequired, parseSlice(&.{
+        "dkv",
+        "--addresses=10.0.1.1:7000,10.0.1.2:7000",
+        "--replica=0",
+    }));
+
+    const config = try parseSlice(&.{
+        "dkv",
+        "--addresses=10.0.1.1:7000,10.0.1.2:7000",
+        "--replica=0",
+        "--cluster=4",
+    });
+    try testing.expectEqual(4, config.cluster);
 }
 
 test "durability off is refused for a replica" {
@@ -164,6 +195,7 @@ test "durability off is refused for a replica" {
         "--addresses=10.0.1.1:7000,10.0.1.2:7000",
         "--replica=0",
         "--durability=off",
+        "--cluster=1",
     }));
 
     const config = try parseSlice(&.{ "dkv", "--durability=off" });
@@ -175,12 +207,14 @@ test "a replica index must name one of the addresses" {
         "dkv",
         "--addresses=10.0.1.1:7000,10.0.1.2:7000",
         "--replica=2",
+        "--cluster=1",
     }));
 
     const config = try parseSlice(&.{
         "dkv",
         "--addresses=10.0.1.1:7000,10.0.1.2:7000",
         "--replica=1",
+        "--cluster=1",
     });
     try testing.expectEqual(1, config.replica.?);
 }
